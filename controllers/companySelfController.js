@@ -1,7 +1,81 @@
-const { Company, Bus, Schedule, Ticket, User, Driver, Route, DriverAssignment, Payment } = require('../models');
+const { Company, Bus, Schedule, Ticket, User, Driver, Route, DriverAssignment, Payment, sequelize } = require('../models');
 const crypto = require('crypto');
 const { Op } = require('sequelize');
 const busService = require('../services/busService');
+
+let scheduleTimeStorageMode = null; // "time" | "timestamp"
+
+function normalizeClockTime(value, fieldName) {
+  if (value === null || value === undefined || value === '') {
+    throw new Error(`${fieldName} is required`);
+  }
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const hh = String(value.getHours()).padStart(2, '0');
+    const mm = String(value.getMinutes()).padStart(2, '0');
+    const ss = String(value.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  const input = String(value).trim();
+  const timeMatch = input.match(/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/);
+  if (timeMatch) {
+    const hh = timeMatch[1];
+    const mm = timeMatch[2];
+    const ss = timeMatch[3] || '00';
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  // Accept ISO-like datetime and extract time part
+  const parsed = new Date(input);
+  if (!Number.isNaN(parsed.getTime())) {
+    const hh = String(parsed.getHours()).padStart(2, '0');
+    const mm = String(parsed.getMinutes()).padStart(2, '0');
+    const ss = String(parsed.getSeconds()).padStart(2, '0');
+    return `${hh}:${mm}:${ss}`;
+  }
+
+  throw new Error(`${fieldName} must be in HH:MM or HH:MM:SS format`);
+}
+
+function normalizeScheduleDate(value) {
+  if (!value) throw new Error('date is required');
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('date must be a valid date');
+  }
+  return parsed.toISOString().slice(0, 10);
+}
+
+async function getScheduleTimeStorageMode() {
+  if (scheduleTimeStorageMode) return scheduleTimeStorageMode;
+
+  const table = await sequelize.getQueryInterface().describeTable('schedules');
+  const departureType = String(table?.departure_time?.type || '').toUpperCase();
+  scheduleTimeStorageMode = departureType.includes('TIMESTAMP') ? 'timestamp' : 'time';
+  return scheduleTimeStorageMode;
+}
+
+async function normalizeScheduleTimesForStorage(scheduleDate, departureTime, arrivalTime) {
+  const dateOnly = normalizeScheduleDate(scheduleDate);
+  const depClock = normalizeClockTime(departureTime, 'departureTime');
+  const arrClock = normalizeClockTime(arrivalTime, 'arrivalTime');
+  const mode = await getScheduleTimeStorageMode();
+
+  if (mode === 'timestamp') {
+    return {
+      scheduleDate: dateOnly,
+      departureTime: new Date(`${dateOnly}T${depClock}`),
+      arrivalTime: new Date(`${dateOnly}T${arrClock}`)
+    };
+  }
+
+  return {
+    scheduleDate: dateOnly,
+    departureTime: depClock,
+    arrivalTime: arrClock
+  };
+}
 
 // Get company for current user
 const getCompany = async (req, res) => {
@@ -375,7 +449,6 @@ const getTickets = async (req, res) => {
 };
 
 const updateTicket = async (req, res) => {
-  const { sequelize } = require('../models');
   const transaction = await sequelize.transaction();
   
   try {
@@ -834,15 +907,17 @@ const createSchedule = async (req, res) => {
       });
     }
 
+    const normalizedTimes = await normalizeScheduleTimesForStorage(date, departureTime, arrivalTime);
+
     // Create schedule
     const schedule = await Schedule.create({
       bus_id: busId,
       route_id: route.id,
       driver_id: driverId || null,
       company_id: companyId,
-      schedule_date: date,
-      departure_time: departureTime, // Store as time string (HH:MM or HH:MM:SS)
-      arrival_time: arrivalTime,     // Store as time string (HH:MM or HH:MM:SS)
+      schedule_date: normalizedTimes.scheduleDate,
+      departure_time: normalizedTimes.departureTime,
+      arrival_time: normalizedTimes.arrivalTime,
       price_per_seat: parseFloat(price),
       available_seats: bus.capacity,
       status: 'scheduled',
@@ -886,13 +961,21 @@ const updateSchedule = async (req, res) => {
       return res.status(404).json({ error: 'Schedule not found' });
     }
 
-    const { route_from, route_to, schedule_date, departure_time, bus_plate_number, price_per_seat, total_seats } = req.body;
+    const { route_from, route_to, schedule_date, departure_time, arrival_time, bus_plate_number, price_per_seat, total_seats } = req.body;
 
     // Update schedule fields
     if (route_from) schedule.route_from = route_from;
     if (route_to) schedule.route_to = route_to;
-    if (schedule_date) schedule.schedule_date = schedule_date;
-    if (departure_time) schedule.departure_time = new Date(departure_time);
+    if (schedule_date || departure_time || arrival_time) {
+      const normalizedTimes = await normalizeScheduleTimesForStorage(
+        schedule_date || schedule.schedule_date,
+        departure_time || schedule.departure_time,
+        arrival_time || schedule.arrival_time
+      );
+      schedule.schedule_date = normalizedTimes.scheduleDate;
+      schedule.departure_time = normalizedTimes.departureTime;
+      schedule.arrival_time = normalizedTimes.arrivalTime;
+    }
     if (price_per_seat) schedule.price_per_seat = parseFloat(price_per_seat);
     if (total_seats) schedule.total_seats = parseInt(total_seats);
 

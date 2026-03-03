@@ -55,11 +55,13 @@ function initializeSocket(server) {
     try {
       const client = await pool.connect();
       
-      // Check if user has a company (driver or company admin)
+      // Check if user has a company (driver, company owner, or company admin user)
       const companyQuery = await client.query(
         `SELECT company_id FROM drivers WHERE user_id = $1
          UNION
-         SELECT id as company_id FROM companies WHERE owner_id = $1`,
+         SELECT id as company_id FROM companies WHERE owner_id = $1
+         UNION
+         SELECT company_id FROM users WHERE id = $1 AND company_id IS NOT NULL`,
         [socket.userId]
       );
       
@@ -177,7 +179,7 @@ function initializeSocket(server) {
         );
         client.release();
 
-        // Broadcast to all passengers tracking this schedule
+        // Broadcast to all clients tracking this schedule
         io.to(`schedule:${scheduleId}`).emit('bus:locationUpdate', {
           scheduleId,
           latitude,
@@ -186,6 +188,18 @@ function initializeSocket(server) {
           heading,
           timestamp: new Date().toISOString(),
         });
+
+        // Broadcast to company's room so company dashboard gets updates instantly
+        if (schedule.company_id) {
+          io.to(`company:${schedule.company_id}`).emit('bus:locationUpdate', {
+            scheduleId,
+            latitude,
+            longitude,
+            speed,
+            heading,
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         console.log(`📡 Broadcasted location to room: schedule:${scheduleId}`);
 

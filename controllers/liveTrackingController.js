@@ -1,5 +1,32 @@
 const { LiveBusLocation, Bus, Driver, Route, Schedule, Company, User } = require('../models');
 const { Op } = require('sequelize');
+const pool = require('../config/pgPool');
+
+let liveLocationColumnCache = null;
+
+async function getLiveLocationColumnMap(client) {
+  if (liveLocationColumnCache) return liveLocationColumnCache;
+
+  const cols = await client.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_name = 'live_bus_locations'`
+  );
+
+  const set = new Set(cols.rows.map(r => r.column_name));
+  liveLocationColumnCache = {
+    hasScheduleId: set.has('schedule_id'),
+    hasBusId: set.has('bus_id'),
+    hasRecordedAt: set.has('recorded_at'),
+    hasUpdatedAt: set.has('updated_at'),
+    hasLatitude: set.has('latitude'),
+    hasLongitude: set.has('longitude'),
+    hasSpeed: set.has('speed'),
+    hasHeading: set.has('heading'),
+  };
+
+  return liveLocationColumnCache;
+}
 
 /**
  * Driver updates their GPS location
@@ -317,7 +344,7 @@ const getScheduleLocation = async (req, res) => {
 
     // Verify schedule exists
     const schedule = await Schedule.findByPk(scheduleId, {
-      attributes: ['id', 'company_id', 'status', 'schedule_date', 'departure_time']
+      attributes: ['id', 'company_id', 'bus_id', 'status', 'schedule_date', 'departure_time']
     });
 
     if (!schedule) {
@@ -361,17 +388,63 @@ const getScheduleLocation = async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized: You do not have access to this schedule' });
     }
 
-    // Fetch latest location
-    const pool = require('../config/pgPool');
+    // Fetch latest location (supports both schedule-based and bus-based live location schemas)
     const client = await pool.connect();
     try {
+      const colMap = await getLiveLocationColumnMap(client);
+
+      if (!colMap.hasLatitude || !colMap.hasLongitude) {
+        return res.json({
+          success: true,
+          hasLocation: false,
+          message: 'Location storage is not configured correctly'
+        });
+      }
+
+      const whereClauses = [];
+      const params = [];
+
+      if (colMap.hasScheduleId) {
+        params.push(scheduleId);
+        whereClauses.push(`l.schedule_id = $${params.length}`);
+      }
+
+      if (colMap.hasBusId && schedule.bus_id) {
+        params.push(schedule.bus_id);
+        whereClauses.push(`l.bus_id = $${params.length}`);
+      }
+
+      if (whereClauses.length === 0) {
+        return res.json({
+          success: true,
+          hasLocation: false,
+          message: 'No compatible location key found'
+        });
+      }
+
+      const timestampCol = colMap.hasRecordedAt
+        ? 'l.recorded_at'
+        : (colMap.hasUpdatedAt ? 'l.updated_at' : 'NOW()');
+
+      const selectScheduleId = colMap.hasScheduleId
+        ? 'l.schedule_id'
+        : `$${params.length + 1}::uuid AS schedule_id`;
+      if (!colMap.hasScheduleId) {
+        params.push(scheduleId);
+      }
+
       const locationResult = await client.query(
-        `SELECT schedule_id, latitude, longitude, speed, heading, recorded_at
-         FROM live_bus_locations
-         WHERE schedule_id = $1
-         ORDER BY recorded_at DESC
+        `SELECT ${selectScheduleId},
+                l.latitude,
+                l.longitude,
+                ${colMap.hasSpeed ? 'l.speed' : 'NULL::numeric AS speed'},
+                ${colMap.hasHeading ? 'l.heading' : 'NULL::numeric AS heading'},
+                ${timestampCol} AS recorded_at
+         FROM live_bus_locations l
+         WHERE (${whereClauses.join(' OR ')})
+         ORDER BY ${timestampCol} DESC
          LIMIT 1`,
-        [scheduleId]
+        params
       );
 
       if (locationResult.rows.length === 0) {

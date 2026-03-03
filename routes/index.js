@@ -11,6 +11,7 @@ const driverRoutes = require('./driver');
 const busesRoutes = require('./buses');
 const seatsRoutes = require('./seats');
 const liveTrackingRoutes = require('./liveTracking');
+const ussdRoutes = require('./ussd');
 const ticketVerificationController = require('../controllers/ticketVerificationController');
 const publicController = require('../controllers/publicController');
 const auth = require('../middleware/authenticate');
@@ -26,6 +27,7 @@ router.use('/driver', driverRoutes);
 router.use('/buses', busesRoutes);
 router.use('/seats', seatsRoutes);
 router.use('/tracking', liveTrackingRoutes);
+router.use('/ussd', ussdRoutes);
 
 // Ticket verification endpoints (public for QR scanning)
 router.get('/tickets/verify/:identifier', ticketVerificationController.verifyTicket);
