@@ -6,6 +6,7 @@ const controller = require('../controllers/companySelfController');
 const sharedController = require('../controllers/sharedRouteController');
 
 router.get('/', auth, controller.getCompany);
+router.put('/settings', auth, requireRoles(['company_admin','admin']), requireCompany, controller.updateCompany);
 router.get('/dashboard-stats', auth, requireRoles(['company_admin','admin']), requireCompany, controller.getDashboardStats);
 router.get('/active-trips', auth, requireRoles(['company_admin','admin']), requireCompany, controller.getActiveTrips);
 router.get('/buses', auth, requireRoles(['company_admin','admin']), requireCompany, controller.getBuses);

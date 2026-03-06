@@ -1,5 +1,8 @@
 const { User, Company, Driver } = require('../models');
 const { generateAccessToken, generateRefreshToken, verifyToken } = require('../config/jwt');
+const pool = require('../config/pgPool');
+const { generateSecureToken } = require('../utils/generateToken');
+const { sendEmail } = require('../utils/mailer');
 
 // Helper to compute a default home path for a given role
 function roleHomePath(role) {
@@ -83,32 +86,52 @@ const register = async (req, res) => {
           });
         }
       } catch (drvErr) {
-        // Log but don't block registration if driver profile creation fails
         console.warn('Failed to create Driver profile during registration:', drvErr && drvErr.message ? drvErr.message : drvErr);
       }
     }
 
-    const token = generateAccessToken(user.id, user.role);
+    // Send email verification — do NOT issue tokens yet
+    await _sendVerificationEmail(user);
 
-    const safeUser = user.toSafeObject();
-    const userPayload = {
-      id: safeUser.id,
-      name: safeUser.full_name || safeUser.name || '',
-      email: safeUser.email,
-      phone: safeUser.phone_number || safeUser.phone || null,
-      role: safeUser.role,
-      avatar_url: safeUser.avatar_url || null,
-      companyId: safeUser.company_id || null,
-    };
     res.status(201).json({
-      user: { ...userPayload, homePath: roleHomePath(userPayload.role) },
-      token,
-      homePath: roleHomePath(userPayload.role)
+      message: 'Registration successful. Please check your email to verify your account before logging in.',
+      email: user.email
     });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
 };
+
+// Internal helper shared by register and sendEmailVerification
+async function _sendVerificationEmail(user) {
+  // Remove any previous pending token for this user
+  await pool.query('DELETE FROM email_verifications WHERE user_id = $1', [user.id]);
+
+  const token = generateSecureToken();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+  await pool.query(
+    'INSERT INTO email_verifications (user_id, token, expires_at) VALUES ($1, $2, $3)',
+    [user.id, token, expiresAt]
+  );
+
+  const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'https://safaritix.com';
+  const verifyUrl = `${baseUrl}/verify-email?token=${token}`;
+
+  await sendEmail({
+    to: user.email,
+    subject: 'SafariTix – Verify Your Email Address',
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#0077B6;">Verify Your Email</h2>
+        <p>Hi ${user.full_name || 'there'},</p>
+        <p>Thanks for joining SafariTix! Click the button below to verify your email. This link expires in <strong>24 hours</strong>.</p>
+        <a href="${verifyUrl}" style="display:inline-block;margin:20px 0;padding:12px 28px;background:#0077B6;color:#fff;text-decoration:none;border-radius:6px;font-size:15px;">Verify Email</a>
+        <p style="color:#6b7280;font-size:13px;">If you didn't create a SafariTix account, you can safely ignore this email.</p>
+      </div>
+    `,
+    text: `Verify your SafariTix email: ${verifyUrl}`
+  });
+}
 
 const login = async (req, res) => {
   try {
@@ -128,7 +151,26 @@ const login = async (req, res) => {
       return res.status(403).json({ error: 'Account is not active' });
     }
 
+    if (!user.email_verified) {
+      return res.status(403).json({
+        error: 'Email not verified. Please check your inbox and verify your email before logging in.',
+        code: 'EMAIL_NOT_VERIFIED',
+        email: user.email
+      });
+    }
+
     const token = generateAccessToken(user.id, user.role);
+    const refreshTok = generateRefreshToken(user.id);
+
+    // Persist refresh token
+    const rtExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await pool.query(
+      'INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
+      [user.id, refreshTok, rtExpiry]
+    ).catch(() => {}); // non-blocking – table may not exist yet in dev
+
+    // Update last login timestamp
+    await user.update({ last_login: new Date() }).catch(() => {});
 
     const safeUser = user.toSafeObject();
     const userPayload = {
@@ -144,6 +186,7 @@ const login = async (req, res) => {
     res.json({
       user: { ...userPayload, homePath: roleHomePath(userPayload.role) },
       token,
+      refreshToken: refreshTok,
       homePath: roleHomePath(userPayload.role),
       must_change_password: !!user.must_change_password
     });
@@ -234,10 +277,177 @@ const getMe = async (req, res) => {
 
 
 
+// ─── Refresh Token ────────────────────────────────────────────────────────────
+const refreshToken = async (req, res) => {
+  const { refreshToken: token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Refresh token required' });
+
+  const decoded = verifyToken(token);
+  if (!decoded || !decoded.userId) {
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
+  }
+
+  // Check the token exists in DB and is not expired
+  const { rows } = await pool.query(
+    'SELECT id FROM refresh_tokens WHERE token = $1 AND expires_at > NOW()',
+    [token]
+  );
+  if (rows.length === 0) {
+    return res.status(401).json({ error: 'Refresh token not recognised or expired' });
+  }
+
+  const user = await User.findByPk(decoded.userId);
+  if (!user || !user.is_active) {
+    return res.status(401).json({ error: 'User account not active' });
+  }
+
+  // Rotate: delete old token, issue new pair
+  await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+
+  const newAccessToken  = generateAccessToken(user.id, user.role);
+  const newRefreshToken = generateRefreshToken(user.id);
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  await pool.query(
+    'INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
+    [user.id, newRefreshToken, expiresAt]
+  );
+
+  res.json({ token: newAccessToken, refreshToken: newRefreshToken });
+};
+
+// ─── Logout ───────────────────────────────────────────────────────────────────
+const logout = async (req, res) => {
+  const { refreshToken: token } = req.body;
+  if (token) {
+    await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]).catch(() => {});
+  }
+  res.json({ message: 'Logged out successfully' });
+};
+
+// ─── Forgot Password ──────────────────────────────────────────────────────────
+const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+
+  // Always return success to avoid user enumeration
+  const user = await User.findOne({ where: { email } });
+  if (!user) return res.json({ message: 'If that email exists, a reset link has been sent' });
+
+  // Invalidate any previous tokens for this user
+  await pool.query('DELETE FROM password_resets WHERE user_id = $1', [user.id]);
+
+  const token = generateSecureToken();
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+  await pool.query(
+    'INSERT INTO password_resets (user_id, token, expires_at) VALUES ($1, $2, $3)',
+    [user.id, token, expiresAt]
+  );
+
+  const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/reset-password?token=${token}`;
+
+  await sendEmail({
+    to: user.email,
+    subject: 'SafariTix – Password Reset Request',
+    html: `
+      <div style="font-family:sans-serif;max-width:520px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#0077B6;">Reset Your Password</h2>
+        <p>Hi ${user.full_name || 'there'},</p>
+        <p>We received a request to reset your SafariTix password. Click the button below to set a new password. This link expires in <strong>1 hour</strong>.</p>
+        <a href="${resetUrl}" style="display:inline-block;margin:20px 0;padding:12px 28px;background:#0077B6;color:#fff;text-decoration:none;border-radius:6px;font-size:15px;">Reset Password</a>
+        <p style="color:#6b7280;font-size:13px;">If you didn't request this, please ignore this email. Your password will remain unchanged.</p>
+      </div>
+    `,
+    text: `Reset your SafariTix password: ${resetUrl}`
+  });
+
+  res.json({ message: 'If that email exists, a reset link has been sent' });
+};
+
+// ─── Reset Password ───────────────────────────────────────────────────────────
+const resetPassword = async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) return res.status(400).json({ error: 'Token and new password are required' });
+
+  if (newPassword.length < 8 || !/[0-9]/.test(newPassword) || !/[A-Za-z]/.test(newPassword)) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters and include letters and numbers' });
+  }
+
+  const { rows } = await pool.query(
+    'SELECT id, user_id FROM password_resets WHERE token = $1 AND used = FALSE AND expires_at > NOW()',
+    [token]
+  );
+  if (rows.length === 0) return res.status(400).json({ error: 'Token is invalid or has expired' });
+
+  const { id: resetId, user_id } = rows[0];
+
+  const user = await User.findByPk(user_id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  user.password = newPassword;
+  user.must_change_password = false;
+  await user.save();
+
+  await pool.query('UPDATE password_resets SET used = TRUE WHERE id = $1', [resetId]);
+
+  // Invalidate all refresh tokens on password change
+  await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [user_id]);
+
+  res.json({ message: 'Password reset successfully. Please log in with your new password.' });
+};
+
+// ─── Send Email Verification (authenticated — for account settings) ─────────────
+const sendEmailVerification = async (req, res) => {
+  const userId = req.userId;
+  const user = await User.findByPk(userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (user.email_verified) return res.status(400).json({ error: 'Email is already verified' });
+  await _sendVerificationEmail(user);
+  res.json({ message: 'Verification email sent. Please check your inbox.' });
+};
+
+// ─── Resend Email Verification (public — user provides their email) ─────────────
+const resendEmailVerification = async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  // Anti-enumeration: always succeed externally
+  const user = await User.findOne({ where: { email } });
+  if (!user || user.email_verified) {
+    return res.json({ message: 'If that email exists and is unverified, a new link has been sent.' });
+  }
+  await _sendVerificationEmail(user);
+  res.json({ message: 'If that email exists and is unverified, a new link has been sent.' });
+};
+
+// ─── Verify Email ─────────────────────────────────────────────────────────────
+const verifyEmail = async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'Verification token required' });
+
+  const { rows } = await pool.query(
+    'SELECT id, user_id FROM email_verifications WHERE token = $1 AND expires_at > NOW()',
+    [token]
+  );
+  if (rows.length === 0) return res.status(400).json({ error: 'Token is invalid or has expired' });
+
+  const { id: verifyId, user_id } = rows[0];
+
+  await User.update({ email_verified: true }, { where: { id: user_id } });
+  await pool.query('DELETE FROM email_verifications WHERE id = $1', [verifyId]);
+
+  res.json({ message: 'Email verified successfully. You can now log in.' });
+};
+
 module.exports = {
   register,
   login,
   getMe,
   changePassword,
-  updateProfile
+  updateProfile,
+  refreshToken,
+  logout,
+  forgotPassword,
+  resetPassword,
+  sendEmailVerification,
+  resendEmailVerification,
+  verifyEmail,
 };

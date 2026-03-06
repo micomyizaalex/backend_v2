@@ -2,6 +2,7 @@ const { sequelize, Seat, SeatLock, Ticket, Schedule, Bus, Route } = require('../
 const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
 const { sendETicketEmail } = require('../services/eTicketService');
+const NotificationService = require('../services/notificationService');
 
 const LOCK_DURATION_MINUTES = parseInt(process.env.SEAT_LOCK_MINUTES || '7', 10);
 
@@ -348,7 +349,77 @@ const confirmLock = async (req, res) => {
     await lock.save({ transaction: t });
 
     await t.commit();
+
     res.json({ message: 'Seat confirmed', ticket_id: ticket.id });
+
+    // Non-blocking: send e-ticket email + in-app notification
+    const confirmedUserId = ticket.passenger_id;
+    const confirmedScheduleId = ticket.schedule_id;
+    const confirmedTicket = ticket;
+    if (confirmedUserId) {
+      (async () => {
+        try {
+          const userQuery = await pool.query(
+            'SELECT email, full_name FROM users WHERE id = $1',
+            [confirmedUserId]
+          );
+          if (userQuery.rows.length === 0) return;
+          const usr = userQuery.rows[0];
+
+          const scheduleDetailsQuery = await pool.query(`
+            SELECT r.origin, r.destination, s.schedule_date, s.departure_time, b.plate_number as bus_plate, b.driver_id
+            FROM schedules s
+            LEFT JOIN routes r ON s.route_id = r.id
+            LEFT JOIN buses b ON s.bus_id = b.id
+            WHERE s.id = $1
+          `, [confirmedScheduleId]);
+          const scheduleInfo = scheduleDetailsQuery.rows[0] || null;
+
+          // E-ticket email
+          if (usr.email) {
+            await sendETicketEmail({
+              userEmail: usr.email,
+              userName: usr.full_name || 'Valued Customer',
+              tickets: [{
+                id: confirmedTicket.id,
+                seat_number: confirmedTicket.seat_number,
+                booking_ref: confirmedTicket.booking_ref,
+                price: parseFloat(confirmedTicket.price || 0)
+              }],
+              scheduleInfo,
+              companyInfo: { name: 'SafariTix Transport' }
+            }).catch(e => console.error('[confirmLock] email error:', e.message));
+          }
+
+          // In-app notification — commuter
+          const route = scheduleInfo ? `${scheduleInfo.origin} → ${scheduleInfo.destination}` : 'your trip';
+          const depDate = scheduleInfo?.schedule_date ? String(scheduleInfo.schedule_date).slice(0, 10) : '';
+          const depTime = scheduleInfo?.departure_time ? String(scheduleInfo.departure_time).slice(0, 5) : '';
+          const dateStr = depDate ? ` on ${depDate}${depTime ? ' ' + depTime : ''}` : '';
+          await NotificationService.createNotification(
+            confirmedUserId,
+            'Ticket Confirmed',
+            `Your ticket from ${route}${dateStr} is confirmed. Seat: ${confirmedTicket.seat_number || '—'}. Ref: ${confirmedTicket.booking_ref || confirmedTicket.id}`,
+            'ticket_booked',
+            { relatedId: confirmedTicket.id, relatedType: 'ticket' }
+          );
+
+          // In-app notification — driver
+          const driverId = scheduleInfo?.driver_id;
+          if (driverId) {
+            await NotificationService.createNotification(
+              driverId,
+              'New Passenger Booked',
+              `${usr.full_name || 'A passenger'} booked seat ${confirmedTicket.seat_number || '—'} on your bus for ${route}${dateStr}.`,
+              'ticket_booked',
+              { relatedId: confirmedTicket.id, relatedType: 'ticket' }
+            );
+          }
+        } catch (err) {
+          console.error('[confirmLock] post-confirm error:', err.message);
+        }
+      })();
+    }
   } catch (error) {
     await t.rollback();
     console.error(error);

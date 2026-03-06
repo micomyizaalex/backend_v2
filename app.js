@@ -7,6 +7,7 @@ const dotenv = require('dotenv');
 const sequelize = require("./config/database");
 const routes = require("./routes");
 const { Op } = require('sequelize');
+const activityLogger = require('./middleware/activityLogger');
 
 dotenv.config();
 
@@ -60,6 +61,9 @@ app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Serve uploaded profile pictures
+app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
+
 // =====================
 // HEALTH CHECK & INFO ROUTES
 // =====================
@@ -94,7 +98,7 @@ app.get('/', (req, res) => {
 // =====================
 // API ROUTES
 // =====================
-app.use("/api", routes);
+app.use("/api", activityLogger, routes);
 
 // =====================
 // QR TICKET SCAN ENDPOINT (public — opened by phone after scanning QR)

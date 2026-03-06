@@ -1,4 +1,5 @@
 let transporter = null;
+const smtpFromEmail = process.env.SMTP_FROM_EMAIL || process.env.SMTP_USER || '';
 try {
   const nodemailer = require('nodemailer');
   // Configure transporter from environment variables if provided
@@ -27,7 +28,7 @@ const sendEmail = async ({ to, subject, text, html }) => {
   if (transporter) {
     try {
       const info = await transporter.sendMail({ 
-        from: `"${process.env.SMTP_FROM_NAME || 'SafariTix'}" <${process.env.SMTP_FROM_EMAIL || user}>`, 
+        from: `"${process.env.SMTP_FROM_NAME || 'SafariTix'}" <${smtpFromEmail}>`, 
         to, 
         subject, 
         text, 

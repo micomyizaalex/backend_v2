@@ -1,5 +1,6 @@
 const pool = require('../config/pgPool');
-const { sendTicketConfirmationEmail } = require('../services/emailService');
+const { sendETicketEmail } = require('../services/eTicketService');
+const NotificationService = require('../services/notificationService');
 
 const isValidDate = (value) => {
   if (!value) return false;
@@ -894,6 +895,7 @@ const bookSharedTicket = async (req, res) => {
               COALESCE(bs.total_seats, bs.available_seats + bs.booked_seats) AS capacity,
               COALESCE(bs.status, 'scheduled') AS status,
               b.status AS bus_status,
+              b.plate_number,
               rr.price
             FROM schedules bs
             INNER JOIN buses b ON b.id = bs.bus_id
@@ -1029,22 +1031,24 @@ const bookSharedTicket = async (req, res) => {
       }
     })();
 
-    // Send confirmation email (fire-and-forget, does not block response)
+    // Send e-ticket email (fire-and-forget, does not block response)
     (async () => {
       try {
         const userResult = await pool.query(
-          `SELECT email, COALESCE(full_name, username, email) AS name FROM users WHERE id::text = $1::text LIMIT 1`,
+          `SELECT email, COALESCE(full_name, email) AS name FROM users WHERE id::text = $1::text LIMIT 1`,
           [passengerId]
         );
         if (userResult.rows.length) {
           const u = userResult.rows[0];
+          if (!u.email) return;
           const ticket = ticketIdResult.rows[0];
           const depDate = schedule.date ? String(schedule.date).slice(0, 10) : '';
           const depTime = schedule.time ? String(schedule.time).slice(0, 5) : '';
-          await sendTicketConfirmationEmail({
+          await sendETicketEmail({
             userEmail: u.email,
-            userName: u.name,
+            userName: u.name || 'Valued Customer',
             tickets: [{
+              id: ticket.ticket_id || ticket.id,
               seat_number: ticket.seat_number,
               booking_ref: ticket.booking_ref,
               price: ticket.price
@@ -1052,15 +1056,63 @@ const bookSharedTicket = async (req, res) => {
             scheduleInfo: {
               origin: from_stop,
               destination: to_stop,
-              departure_time: depDate && depTime ? `${depDate} ${depTime}` : depDate || depTime,
+              schedule_date: depDate,
+              departure_time: depTime,
               bus_plate: schedule.plate_number || ''
-            }
+            },
+            companyInfo: { name: 'SafariTix Transport' }
           });
         }
       } catch (e) {
-        console.error('Failed to send booking confirmation email:', e.message);
+        console.error('Failed to send e-ticket email:', e.message);
       }
     })();
+
+    // In-app notifications — commuter + driver (fire-and-forget)
+    if (passengerId) {
+      (async () => {
+        try {
+          const ticket = ticketIdResult.rows[0];
+          const depDate = schedule.date ? String(schedule.date).slice(0, 10) : '';
+          const depTime = schedule.time ? String(schedule.time).slice(0, 5) : '';
+          const dateStr = depDate ? ` on ${depDate}${depTime ? ' ' + depTime : ''}` : '';
+
+          // Commuter name
+          const userRes = await pool.query(
+            `SELECT full_name FROM users WHERE id::text = $1::text LIMIT 1`,
+            [passengerId]
+          );
+          const commuterName = userRes.rows[0]?.full_name || passenger_name || 'Passenger';
+
+          // Notify commuter
+          await NotificationService.createNotification(
+            passengerId,
+            'Ticket Confirmed',
+            `Your ticket from ${from_stop} to ${to_stop}${dateStr} is confirmed. Seat: ${ticket.seat_number || '—'}. Ref: ${ticket.booking_ref || ticket.ticket_id || ''}`,
+            'ticket_booked',
+            { relatedId: ticket.ticket_id || ticket.id, relatedType: 'ticket' }
+          );
+
+          // Notify driver
+          const busRes = await pool.query(
+            `SELECT driver_id FROM buses WHERE id::text = $1::text LIMIT 1`,
+            [schedule.bus_id]
+          );
+          const driverId = busRes.rows[0]?.driver_id;
+          if (driverId) {
+            await NotificationService.createNotification(
+              driverId,
+              'New Passenger Booked',
+              `${commuterName} booked seat ${ticket.seat_number || '—'} on your bus for ${from_stop} → ${to_stop}${dateStr}.`,
+              'ticket_booked',
+              { relatedId: ticket.ticket_id || ticket.id, relatedType: 'ticket' }
+            );
+          }
+        } catch (e) {
+          console.error('[bookSharedTicket] notification error:', e.message);
+        }
+      })();
+    }
 
     res.status(201).json({ success: true, ticket: ticketIdResult.rows[0] });
   } catch (error) {

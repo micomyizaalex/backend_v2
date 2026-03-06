@@ -7,8 +7,9 @@ const getStats = async (req, res) => {
   try {
     const totalCompanies = await Company.count();
     const activeCompanies = await Company.count({ where: { status: 'approved' } });
-    const totalBuses = await Bus.count();
-    const totalTickets = await Ticket.count();
+    const totalBuses    = await Bus.count();
+    const activeBuses   = await Bus.count({ where: { status: 'active' } });
+    const totalTickets  = await Ticket.count();
     const totalUsers = await User.count({ where: { role: 'commuter' } });
 
     // Total revenue from all tickets
@@ -32,6 +33,7 @@ const getStats = async (req, res) => {
       totalCompanies,
       activeCompanies,
       totalBuses,
+      activeBuses,
       totalTickets,
       totalRevenue,
       totalCommuters: totalUsers,
@@ -54,27 +56,37 @@ const getStats = async (req, res) => {
 // Return companies list (optionally filter pending)
 const getCompanies = async (req, res) => {
   try {
-    const { filter } = req.query; // e.g., 'pending'
-    const where = {};
-    if (filter === 'pending') where.status = 'pending';
+    const { filter } = req.query;
+    const conditions = filter === 'pending' ? `WHERE c.status = 'pending'` : '';
 
-    const companies = await Company.findAll({ 
-      where,
-      order: [['created_at', 'DESC']]
-    });
+    const result = await pgPool.query(`
+      SELECT
+        c.id, c.name, c.email, c.phone_number AS phone,
+        c.status, c.subscription_status, c.subscription_plan,
+        c.owner_id, c.created_at, c.updated_at,
+        COUNT(DISTINCT u.id) FILTER (WHERE u.role = 'driver') AS driver_count,
+        COUNT(DISTINCT b.id) AS bus_count
+      FROM companies c
+      LEFT JOIN users u ON u.company_id = c.id
+      LEFT JOIN buses b ON b.company_id = c.id
+      ${conditions}
+      GROUP BY c.id
+      ORDER BY c.created_at DESC
+    `);
 
-    // Map fields to frontend expected shapes (camelCase)
-    const mapped = companies.map(c => ({
-      id: c.id,
-      name: c.name,
-      email: c.email,
-      phone: c.phone_number || '',
-      status: c.status,
+    const mapped = result.rows.map(c => ({
+      id:                 c.id,
+      name:               c.name,
+      email:              c.email || '',
+      phone:              c.phone || '',
+      status:             c.status,
       subscriptionStatus: c.subscription_status || 'inactive',
-      subscriptionPlan: c.subscription_plan || 'Free Trial',
-      ownerId: c.owner_id,
-      createdAt: c.created_at,
-      updatedAt: c.updated_at
+      subscriptionPlan:   c.subscription_plan   || 'Free Trial',
+      ownerId:            c.owner_id,
+      createdAt:          c.created_at,
+      updatedAt:          c.updated_at,
+      driverCount:        parseInt(c.driver_count, 10) || 0,
+      busCount:           parseInt(c.bus_count,    10) || 0,
     }));
 
     res.json({ companies: mapped });
@@ -112,23 +124,29 @@ const getUsers = async (req, res) => {
 // Get all buses with company info
 const getBuses = async (req, res) => {
   try {
-    const buses = await Bus.findAll({
-      include: [{
-        model: Company,
-        attributes: ['id', 'name']
-      }],
-      order: [['created_at', 'DESC']]
-    });
+    const result = await pgPool.query(`
+      SELECT
+        b.id, b.plate_number, b.model, b.capacity, b.status,
+        b.company_id, b.driver_id, b.created_at,
+        c.name  AS company_name,
+        u.full_name AS driver_name
+      FROM buses b
+      LEFT JOIN companies c ON c.id = b.company_id
+      LEFT JOIN users     u ON u.id = b.driver_id
+      ORDER BY b.created_at DESC
+    `);
 
-    const mapped = buses.map(b => ({
-      id: b.id,
+    const mapped = result.rows.map(b => ({
+      id:          b.id,
       plateNumber: b.plate_number,
-      model: b.model,
-      capacity: b.capacity,
-      status: b.status,
-      companyId: b.company_id,
-      companyName: b.Company ? b.Company.name : 'N/A',
-      createdAt: b.created_at
+      model:       b.model,
+      capacity:    b.capacity,
+      status:      b.status,
+      companyId:   b.company_id,
+      companyName: b.company_name || 'N/A',
+      driverId:    b.driver_id,
+      driverName:  b.driver_name || '—',
+      createdAt:   b.created_at,
     }));
 
     res.json({ buses: mapped });
@@ -152,18 +170,18 @@ const getRecentTickets = async (req, res) => {
         t.seat_number,
         t.created_at,
         t.company_id,
-        u.full_name as passenger_name,
-        u.email as passenger_email,
-        s.departure_time,
-        s.arrival_time,
-        r.origin,
-        r.destination,
-        c.name as company_name
+        t.from_stop,
+        t.to_stop,
+        u.full_name  AS passenger_name,
+        u.email      AS passenger_email,
+        COALESCE(r.origin,      t.from_stop) AS origin,
+        COALESCE(r.destination, t.to_stop)   AS destination,
+        c.name AS company_name
       FROM tickets t
-      LEFT JOIN users u ON t.passenger_id = u.id
-      LEFT JOIN schedules s ON t.schedule_id = s.id
-      LEFT JOIN routes r ON s.route_id = r.id
-      LEFT JOIN companies c ON t.company_id = c.id
+      LEFT JOIN users     u ON t.passenger_id = u.id
+      LEFT JOIN schedules s ON t.schedule_id::text = s.id::text
+      LEFT JOIN routes    r ON s.route_id = r.id
+      LEFT JOIN companies c ON t.company_id  = c.id
       ORDER BY t.created_at DESC
       LIMIT $1
     `;
@@ -214,11 +232,69 @@ const getRevenueData = async (req, res) => {
   }
 };
 
+// GET /api/admin/activity-logs
+const getActivityLogs = async (req, res) => {
+  try {
+    const page      = Math.max(parseInt(req.query.page,  10) || 1, 1);
+    const limit     = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset    = (page - 1) * limit;
+    const userId    = req.query.user_id   || null;
+    const action    = req.query.action    || null;
+    const method    = req.query.method    || null;
+    const dateFrom  = req.query.date_from || null;
+    const dateTo    = req.query.date_to   || null;
+
+    const conditions = [];
+    const params     = [];
+
+    if (userId)   { params.push(userId);                            conditions.push(`al.user_id = $${params.length}`); }
+    if (action)   { params.push(`%${action}%`);                     conditions.push(`al.action ILIKE $${params.length}`); }
+    if (method)   { params.push(method.toUpperCase());               conditions.push(`al.method = $${params.length}`); }
+    if (dateFrom) { params.push(dateFrom);                          conditions.push(`al.created_at >= $${params.length}::date`); }
+    if (dateTo)   { params.push(dateTo);                            conditions.push(`al.created_at <  ($${params.length}::date + INTERVAL '1 day')`); }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    params.push(limit);  const limitIdx  = params.length;
+    params.push(offset); const offsetIdx = params.length;
+
+    const rows = await pgPool.query(
+      `SELECT
+         al.id, al.user_id, al.action, al.method, al.path,
+         al.status_code, al.ip_address, al.user_agent, al.created_at,
+         u.full_name AS user_name, u.email AS user_email, u.role AS user_role
+       FROM activity_logs al
+       LEFT JOIN users u ON u.id = al.user_id
+       ${where}
+       ORDER BY al.created_at DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      params
+    );
+
+    const countParams = params.slice(0, params.length - 2);
+    const countResult = await pgPool.query(
+      `SELECT COUNT(*) FROM activity_logs al ${where}`,
+      countParams
+    );
+
+    res.json({
+      logs:  rows.rows,
+      total: parseInt(countResult.rows[0].count, 10),
+      page,
+      limit,
+    });
+  } catch (error) {
+    console.error('getActivityLogs error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
 module.exports = {
   getStats,
   getCompanies,
   getUsers,
   getBuses,
   getRecentTickets,
-  getRevenueData
+  getRevenueData,
+  getActivityLogs,
 };

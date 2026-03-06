@@ -1,122 +1,72 @@
 // controllers/notificationController.js
 const NotificationService = require('../services/notificationService');
 
-// GET /notifications/:userId
+// GET /api/notifications — all for logged-in user
 const getUserNotifications = async (req, res) => {
   try {
-    const { userId } = req
-    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 30, 100);
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const offset = (page - 1) * limit;
-
-    const notifications = await NotificationService.getForUserWithNotifiable(
-      userId,
-      { limit, offset }
-    );
-
-    res.json({
-      meta: { page, limit, count: notifications.length },
-      data: notifications
-    });
+    const notifications = await NotificationService.getForUser(req.userId, { limit, offset });
+    res.json({ data: notifications, meta: { page, limit, count: notifications.length } });
   } catch (err) {
     console.error('getUserNotifications', err);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-// PATCH /notifications/:id/read
+// GET /api/notifications/unread-count
+const getUnreadCount = async (req, res) => {
+  try {
+    const count = await NotificationService.getUnreadCount(req.userId);
+    res.json({ count });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// PATCH /api/notifications/:id/read
 const markAsRead = async (req, res) => {
   try {
-    const { id } = req.params;
-    const n = await NotificationService.markAsRead(id);
-
+    const n = await NotificationService.markAsRead(req.params.id);
     if (!n) return res.status(404).json({ message: 'Notification not found' });
-
-    
     res.json({ message: 'Marked as read' });
   } catch (err) {
-    console.error('markAsRead', err);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-const markAsUnread = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const n = await NotificationService.markAsUnread(id);
-
-    if (!n) return res.status(404).json({ message: 'Notification not found' });
-
-    n.dataValues.notifiable = await n.getNotifiable().catch(() => null);
-
-    res.json({ message: 'Marked as unread', notification: n });
-  } catch (err) {
-    console.error('markAsUnread', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
+// PATCH /api/notifications/user/read-all
 const markAllAsRead = async (req, res) => {
   try {
-    const { userId } = req;
-
-    const updatedCount = await NotificationService.markAllAsRead(userId);
-
+    const updatedCount = await NotificationService.markAllAsRead(req.userId);
     res.json({ message: 'All notifications marked as read', updatedCount });
   } catch (err) {
-    console.error('markAllAsRead', err);
     res.status(500).json({ message: 'Server error' });
   }
-}
+};
 
-
-
-// DELETE /notifications/:id
+// DELETE /api/notifications/:id
 const deleteNotification = async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const ok = await NotificationService.delete(id);
-
+    const ok = await NotificationService.delete(req.params.id);
     if (!ok) return res.status(404).json({ message: 'Notification not found' });
-
     res.json({ message: 'Notification deleted' });
   } catch (err) {
-    console.error('deleteNotification', err);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-// POST /notifications/create
+// POST /api/notifications — internal/admin create
 const createNotification = async (req, res) => {
   try {
-    const { userId, notifiableId, notifiableModelName, type, message, data } = req.body;
-
-    const notification = await NotificationService.notify({
-      userId,
-      notifiableId,
-      notifiableModelName,
-      type,
-      message,
-      data
-    });
-
-    notification.dataValues.notifiable = await notification
-      .getNotifiable()
-      .catch(() => null);
-
-    res.status(201).json({ message: 'Notification created', notification });
+    const { userId, title, message, type } = req.body;
+    if (!userId || !title || !message) return res.status(400).json({ message: 'userId, title and message are required' });
+    const n = await NotificationService.createNotification(userId, title, message, type || 'system');
+    res.status(201).json({ message: 'Notification created', notification: n });
   } catch (err) {
-    console.error('createNotification', err);
     res.status(500).json({ message: 'Server error' });
   }
 };
 
-module.exports = {
-  getUserNotifications,
-  markAsRead,
-  markAsUnread,
-  markAllAsRead,
-  deleteNotification,
-  createNotification
-};
+module.exports = { getUserNotifications, getUnreadCount, markAsRead, markAllAsRead, deleteNotification, createNotification };

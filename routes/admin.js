@@ -27,4 +27,7 @@ router.get('/revenue', auth, isAdmin, adminController.getRevenueData);
 router.post('/companies/:id/approve', auth, isAdmin, companyController.approveCompany);
 router.post('/companies/:id/reject', auth, isAdmin, companyController.rejectCompany);
 
+// Activity logs
+router.get('/activity-logs', auth, isAdmin, adminController.getActivityLogs);
+
 module.exports = router;

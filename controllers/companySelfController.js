@@ -1613,6 +1613,41 @@ const getRevenue = async (req, res) => {
   }
 };
 
+// ─── PUT /api/company/settings ────────────────────────────────────────────────
+const updateCompany = async (req, res) => {
+  try {
+    const companyId = req.companyId || (await User.findByPk(req.userId))?.company_id;
+    if (!companyId) return res.status(404).json({ error: 'Company not found' });
+
+    const company = await Company.findByPk(companyId);
+    if (!company) return res.status(404).json({ error: 'Company not found' });
+
+    const { name, email, phone, address } = req.body;
+
+    if (name && name.trim()) company.name = name.trim();
+    if (typeof email !== 'undefined') company.email = email || null;
+    if (typeof phone !== 'undefined') company.phone = phone || null;
+    if (typeof address !== 'undefined') company.address = address || null;
+
+    await company.save();
+
+    res.json({
+      message: 'Company settings updated',
+      company: {
+        id: company.id,
+        name: company.name,
+        email: company.email || null,
+        phone: company.phone || null,
+        address: company.address || null,
+        status: company.status,
+        subscriptionStatus: company.subscription_status || 'inactive',
+      }
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+};
+
 module.exports = {
   getCompany,
   getBuses,
@@ -1636,7 +1671,8 @@ module.exports = {
   getScheduleJournals,
   getDashboardStats,
   getActiveTrips,
-  getRevenue
+  getRevenue,
+  updateCompany
 };
 
 
