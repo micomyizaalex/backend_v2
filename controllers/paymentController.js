@@ -56,7 +56,21 @@ const initiatePayment = async (req, res) => {
           s.price_per_seat,
           s.company_id,
           s.status,
-          b.status as bus_status
+          b.status as bus_status,
+          COALESCE(
+            (
+              SELECT rr.price
+              FROM rura_routes rr
+              LEFT JOIN routes r ON r.id = s.route_id
+              WHERE rr.status = 'active'
+                AND LOWER(TRIM(rr.from_location)) = LOWER(TRIM(r.origin))
+                AND LOWER(TRIM(rr.to_location)) = LOWER(TRIM(r.destination))
+                AND rr.effective_date <= COALESCE(s.schedule_date::date, CURRENT_DATE)
+              ORDER BY rr.effective_date DESC, rr.created_at DESC
+              LIMIT 1
+            ),
+            s.price_per_seat
+          ) as effective_price
         FROM schedules s
         LEFT JOIN buses b ON s.bus_id = b.id
         WHERE s.id = $1
@@ -116,7 +130,7 @@ const initiatePayment = async (req, res) => {
       }
 
       // Calculate total amount
-      const pricePerSeat = parseFloat(schedule.price_per_seat);
+      const pricePerSeat = parseFloat(schedule.effective_price);
       const totalAmount = pricePerSeat * numTickets;
 
       // Generate transaction reference
@@ -476,7 +490,7 @@ const bookTicket = async (req, res) => {
           paymentId,
           seatNumber,
           bookingRef,
-          payment.price_per_seat
+          parseFloat(payment.amount) / numTickets
         ]);
 
         tickets.push(ticketResult.rows[0]);

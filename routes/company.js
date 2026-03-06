@@ -3,6 +3,7 @@ const router = express.Router();
 const auth = require('../middleware/authenticate');
 const { requireRoles, requireCompany } = require('../middleware/authorize');
 const controller = require('../controllers/companySelfController');
+const sharedController = require('../controllers/sharedRouteController');
 
 router.get('/', auth, controller.getCompany);
 router.get('/dashboard-stats', auth, requireRoles(['company_admin','admin']), requireCompany, controller.getDashboardStats);
@@ -27,5 +28,13 @@ router.get('/drivers/:id', auth, requireRoles(['company_admin','admin']), requir
 router.post('/drivers', auth, requireRoles(['company_admin','admin']), requireCompany, controller.createDriver);
 router.put('/drivers/:id', auth, requireRoles(['company_admin','admin']), requireCompany, controller.updateDriver);
 router.delete('/drivers/:id', auth, requireRoles(['company_admin','admin']), requireCompany, controller.deleteDriver);
+
+// Shared-route management (route_stops + bus_schedules + segment-aware booking)
+router.get('/shared/routes', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.listSharedRoutes);
+router.get('/shared/routes/:routeId/stops', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.getRouteStops);
+router.put('/shared/routes/:routeId/stops', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.upsertRouteStops);
+router.get('/shared/schedules', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.listSharedSchedules);
+router.post('/shared/schedules', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.createSharedSchedule);
+router.patch('/shared/schedules/:scheduleId/status', auth, requireRoles(['company_admin','admin']), requireCompany, sharedController.updateSharedScheduleStatus);
 
 module.exports = router;

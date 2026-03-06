@@ -609,29 +609,59 @@ const scanTicket = async (req, res) => {
 	let client;
 
 	try {
-		const { qrCode } = req.body || {};
+		const { qrCode, ticketId } = req.body || {};
+		const rawScanValue = (typeof qrCode === 'string' && qrCode.trim()) || (typeof ticketId === 'string' && ticketId.trim()) || '';
 
-		if (!qrCode || typeof qrCode !== 'string') {
+		if (!rawScanValue) {
 			return res.status(400).json({ error: 'QR code is required', valid: false, message: 'QR code missing' });
+		}
+
+		let ticketIdentifier = rawScanValue;
+		try {
+			const parsed = JSON.parse(rawScanValue);
+			if (parsed && typeof parsed === 'object' && typeof parsed.ticketId === 'string' && parsed.ticketId.trim()) {
+				ticketIdentifier = parsed.ticketId.trim();
+			}
+		} catch (parseErr) {
+			// Keep raw QR text as identifier when payload is not JSON.
 		}
 
 		client = await pool.connect();
 
-		// Query driver profile using PostgreSQL
+		// Query legacy driver profile; fall back to canonical users table.
 		const driverQuery = await client.query(
 			'SELECT id, user_id, company_id, name FROM drivers WHERE user_id = $1',
 			[req.userId]
 		);
 
-		if (driverQuery.rowCount === 0) {
-			client.release();
-			return res.status(403).json({ error: 'Driver profile not found', valid: false, message: 'Driver profile missing' });
+		let driver;
+		if (driverQuery.rowCount > 0) {
+			driver = driverQuery.rows[0];
+		} else {
+			const userQuery = await client.query(
+				'SELECT id, role, company_id, full_name FROM users WHERE id = $1',
+				[req.userId]
+			);
+			if (userQuery.rowCount === 0) {
+				return res.status(403).json({ error: 'Driver profile not found', valid: false, message: 'Driver profile missing' });
+			}
+			const userRow = userQuery.rows[0];
+			if (String(userRow.role || '').toLowerCase() !== 'driver') {
+				return res.status(403).json({ error: 'Driver role required', valid: false, message: 'Driver role required' });
+			}
+			driver = {
+				id: null,
+				user_id: userRow.id,
+				company_id: userRow.company_id,
+				name: userRow.full_name || 'Driver',
+			};
 		}
 
-		const driver = driverQuery.rows[0];
 		await client.query('BEGIN');
 
-		// Try to match by UUID id or by booking reference
+		// Try to match by UUID id or by booking reference.
+		// Tickets may reference either the legacy `schedules` table or the shared-route
+		// `bus_schedules` table, so we LEFT JOIN both and COALESCE the columns we need.
 		const ticketResult = await client.query(
 			`SELECT 
 				 t.id,
@@ -647,22 +677,24 @@ const scanTicket = async (req, res) => {
 				 u.full_name AS passenger_name,
 				 u.email AS passenger_email,
 				 u.phone_number AS passenger_phone,
-				 s.departure_time,
-				 s.arrival_time,
-				 s.schedule_date,
-				 s.bus_id,
-				 s.status AS trip_status,
-				 r.origin AS route_from,
-				 r.destination AS route_to,
+				 COALESCE(s1.departure_time, s2.time) AS departure_time,
+				 s1.arrival_time,
+				 COALESCE(s1.schedule_date, s2.date::date) AS schedule_date,
+				 COALESCE(s1.bus_id, s2.bus_id) AS bus_id,
+				 COALESCE(s1.status, s2.status) AS trip_status,
+				 COALESCE(r1.origin, rr.from_location) AS route_from,
+				 COALESCE(r1.destination, rr.to_location) AS route_to,
 				 b.plate_number AS bus_plate
 			 FROM tickets t
 			 INNER JOIN users u ON t.passenger_id = u.id
-			 INNER JOIN schedules s ON t.schedule_id = s.id
-			 INNER JOIN routes r ON s.route_id = r.id
-			 LEFT JOIN buses b ON s.bus_id = b.id
+			 LEFT JOIN schedules s1 ON s1.id = t.schedule_id
+			 LEFT JOIN routes r1 ON r1.id = s1.route_id
+			 LEFT JOIN bus_schedules s2 ON s2.schedule_id::text = t.schedule_id::text
+			 LEFT JOIN rura_routes rr ON rr.id::text = s2.route_id::text
+			 LEFT JOIN buses b ON b.id = COALESCE(s1.bus_id, s2.bus_id)
 			 WHERE t.id::text = $1 OR t.booking_ref = $1
 			 FOR UPDATE OF t`,
-			[qrCode]
+			[ticketIdentifier]
 		);
 
 		if (ticketResult.rowCount === 0) {
@@ -678,8 +710,11 @@ const scanTicket = async (req, res) => {
 			return res.status(403).json({ error: 'Ticket not in your company', valid: false, message: 'Not for this company ❌' });
 		}
 
-		// Validate trip is active
-		if (ticketRow.trip_status !== 'in_progress' && ticketRow.trip_status !== 'ACTIVE') {
+		// Validate trip is active or scheduled.
+		// bus_schedules-based trips remain 'scheduled' until departure (no explicit start-trip flow),
+		// so we allow 'scheduled' in addition to the legacy 'in_progress'/'ACTIVE' states.
+		const allowedStatuses = ['in_progress', 'active', 'scheduled'];
+		if (!allowedStatuses.includes(String(ticketRow.trip_status || '').toLowerCase())) {
 			await client.query('ROLLBACK');
 			return res.status(400).json({ 
 				valid: false, 
@@ -730,12 +765,14 @@ const scanTicket = async (req, res) => {
 
 		const checkedInAt = updateResult.rows[0].checked_in_at;
 
-		// Create audit log entry
-		await client.query(
-			`INSERT INTO ticket_scan_logs (ticket_id, driver_id, schedule_id, passenger_id, scanned_at, scan_status)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			[ticketRow.id, driver.id, ticketRow.schedule_id, ticketRow.passenger_id, checkedInAt, 'SUCCESS']
-		);
+		// Create audit log entry only when a legacy driver id exists.
+		if (driver.id) {
+			await client.query(
+				`INSERT INTO ticket_scan_logs (ticket_id, driver_id, schedule_id, passenger_id, scanned_at, scan_status)
+				 VALUES ($1, $2, $3, $4, $5, $6)`,
+				[ticketRow.id, driver.id, ticketRow.schedule_id, ticketRow.passenger_id, checkedInAt, 'SUCCESS']
+			);
+		}
 
 		await client.query('COMMIT');
 

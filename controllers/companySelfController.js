@@ -857,10 +857,10 @@ const createSchedule = async (req, res) => {
       return res.status(403).json({ error: 'No company associated with user' });
     }
 
-    const { busId, routeFrom, routeTo, departureTime, arrivalTime, price, date, driverId } = req.body;
+    const { busId, routeFrom, routeTo, departureTime, arrivalTime, date, driverId } = req.body;
 
-    if (!busId || !routeFrom || !routeTo || !departureTime || !arrivalTime || !price || !date) {
-      return res.status(400).json({ error: 'Bus, route, times, price, and date are required' });
+    if (!busId || !routeFrom || !routeTo || !departureTime || !arrivalTime || !date) {
+      return res.status(400).json({ error: 'Bus, route, times, and date are required' });
     }
 
     // Verify bus exists and belongs to this company
@@ -888,6 +888,20 @@ const createSchedule = async (req, res) => {
         }
       }
     }
+
+    // Look up RURA-regulated price (companies cannot set prices manually)
+    const { QueryTypes } = require('sequelize');
+    const ruaResult = await sequelize.query(
+      `SELECT price FROM rura_routes
+       WHERE LOWER(from_location) = LOWER(:from) AND LOWER(to_location) = LOWER(:to)
+       AND LOWER(status) = 'active'
+       ORDER BY effective_date DESC LIMIT 1`,
+      { replacements: { from: routeFrom, to: routeTo }, type: QueryTypes.SELECT }
+    );
+    if (!ruaResult.length) {
+      return res.status(400).json({ error: `No active RURA route found for ${routeFrom} → ${routeTo}. Price cannot be set manually.` });
+    }
+    const ruraPrice = parseFloat(ruaResult[0].price);
 
     // Find or create route
     let route = await Route.findOne({
@@ -918,7 +932,7 @@ const createSchedule = async (req, res) => {
       schedule_date: normalizedTimes.scheduleDate,
       departure_time: normalizedTimes.departureTime,
       arrival_time: normalizedTimes.arrivalTime,
-      price_per_seat: parseFloat(price),
+      price_per_seat: ruraPrice,
       available_seats: bus.capacity,
       status: 'scheduled',
       created_by: userId
@@ -976,7 +990,7 @@ const updateSchedule = async (req, res) => {
       schedule.departure_time = normalizedTimes.departureTime;
       schedule.arrival_time = normalizedTimes.arrivalTime;
     }
-    if (price_per_seat) schedule.price_per_seat = parseFloat(price_per_seat);
+    // price_per_seat is read-only — always sourced from rura_routes, never from request body
     if (total_seats) schedule.total_seats = parseInt(total_seats);
 
     // Update bus if plate number provided
