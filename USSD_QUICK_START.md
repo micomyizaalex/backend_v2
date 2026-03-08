@@ -75,7 +75,7 @@ Then type inputs like:
 
 ```bash
 # Test main menu
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "TEST123",
@@ -85,7 +85,7 @@ curl -X POST http://localhost:5000/api/ussd \
   }'
 
 # Test booking flow
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "TEST123",
@@ -194,7 +194,7 @@ npm start
 
 ### "Cannot POST /api/ussd"
 - Verify server is running
-- Check the URL: `http://localhost:5000/api/ussd`
+- Check the URL: `https://backend-7cxc.onrender.com/api/$1/api/ussd`
 - Ensure Content-Type header is set
 
 ### USSD returns empty response

@@ -10,7 +10,7 @@ require('dotenv').config();
 const axios = require('axios');
 
 // Configuration
-const BASE_URL = process.env.APP_URL || 'http://localhost:5000';
+const BASE_URL = process.env.APP_URL || 'https://backend-7cxc.onrender.com/api/$1';
 const USSD_ENDPOINT = `${BASE_URL}/api/ussd`;
 
 // Test session data

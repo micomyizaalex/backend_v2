@@ -283,7 +283,7 @@ SEAT_LOCK_MINUTES=7
 
 # Server configuration
 PORT=5000
-APP_URL=http://localhost:5000
+APP_URL=https://backend-7cxc.onrender.com/api/$1
 
 # Database
 DATABASE_URL=postgresql://user:pass@host:port/dbname

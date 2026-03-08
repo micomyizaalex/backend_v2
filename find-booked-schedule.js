@@ -39,7 +39,7 @@ async function findBookedSchedule() {
         console.log(`  Seat ${row.seat_number}: ${row.status}`);
       });
       
-      console.log(`\n✅ Test with: http://localhost:5000/api/seats/schedules/${scheduleId}/booked-seats`);
+      console.log(`\n✅ Test with: https://backend-7cxc.onrender.com/api/$1/api/seats/schedules/${scheduleId}/booked-seats`);
     } else {
       console.log('\n❌ No schedules with booked tickets found');
     }

@@ -35,7 +35,7 @@ Added email confirmation to **ALL** ticket booking endpoints:
 
 **Step 1: Login to get token**
 ```bash
-POST http://localhost:5000/api/auth/login
+POST https://backend-7cxc.onrender.com/api/$1/api/auth/login
 Content-Type: application/json
 
 {
@@ -46,7 +46,7 @@ Content-Type: application/json
 
 **Step 2: Book seats**
 ```bash
-POST http://localhost:5000/api/seats/book-seats
+POST https://backend-7cxc.onrender.com/api/$1/api/seats/book-seats
 Authorization: Bearer YOUR_ACCESS_TOKEN
 Content-Type: application/json
 

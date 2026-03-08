@@ -630,7 +630,7 @@ const sendETicketEmail = async ({
       o: scheduleInfo?.origin || 'N/A', // origin
       d: scheduleInfo?.destination || 'N/A', // destination
       dt: combinedDateTime || scheduleDate || new Date().toISOString().split('T')[0], // date
-      v: `${process.env.APP_URL || 'http://localhost:5000'}/api/tickets/verify/${ticket.id || ticket.bookingRef}` // verificationUrl
+      v: `${process.env.APP_URL || 'https://backend-7cxc.onrender.com/api/$1'}/api/tickets/verify/${ticket.id || ticket.bookingRef}` // verificationUrl
     };
     
     console.log('📱 QR Data prepared (optimized):', {

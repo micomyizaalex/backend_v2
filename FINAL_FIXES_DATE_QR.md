@@ -157,7 +157,7 @@ The QR code now contains:
   "o": "kigali",
   "d": "gatsibo",
   "dt": "2026-02-25T21:05:00",
-  "v": "http://localhost:5000/api/tickets/verify/ticket-uuid"
+  "v": "https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/ticket-uuid"
 }
 ```
 

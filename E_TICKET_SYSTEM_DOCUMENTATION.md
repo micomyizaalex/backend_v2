@@ -93,7 +93,7 @@ User Receives Beautiful E-Ticket
   "passengerEmail": "user@example.com",
   "seatNumber": "A1",
   "date": "2026-02-24T10:00:00Z",
-  "verificationUrl": "http://localhost:5000/api/tickets/verify/ticket-id"
+  "verificationUrl": "https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/ticket-id"
 }
 ```
 
@@ -251,7 +251,7 @@ SMTP_FROM_EMAIL=your-email@gmail.com
 SMTP_FROM_NAME=SafariTix - Bus Booking
 
 # URLs (for QR verification and action buttons)
-APP_URL=http://localhost:5000
+APP_URL=https://backend-7cxc.onrender.com/api/$1
 FRONTEND_URL=http://localhost:5173
 ```
 
@@ -273,10 +273,10 @@ node scripts/test-booking-with-email.js micomyizaa742@gmail.com
 ### **Test Ticket Verification**
 ```bash
 # Using curl
-curl http://localhost:5000/api/tickets/verify/BK-2026-ABC123
+curl https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/BK-2026-ABC123
 
 # Using browser
-http://localhost:5000/api/tickets/verify/your-booking-ref
+https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/your-booking-ref
 ```
 
 ### **Manual Testing Checklist**
@@ -454,7 +454,7 @@ Possible additions:
 
 For issues or questions:
 - Check server logs: `backend_v2/app.js`
-- Test verification: `curl http://localhost:5000/api/tickets/verify/test`
+- Test verification: `curl https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/test`
 - Email support: support@safaritix.com
 
 ---

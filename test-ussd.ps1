@@ -3,7 +3,7 @@
 # 
 # Usage: .\test-ussd.ps1
 
-$baseUrl = "http://localhost:5000/api/ussd"
+$baseUrl = "https://backend-7cxc.onrender.com/api/$1/api/ussd"
 $headers = @{
     "Content-Type" = "application/json"
 }
@@ -44,7 +44,7 @@ function Test-USSDRequest {
 # Check if server is running
 Write-Host "Checking server health..." -ForegroundColor Yellow
 try {
-    $health = Invoke-RestMethod -Uri "http://localhost:5000/api/health" -Method Get
+    $health = Invoke-RestMethod -Uri "https://backend-7cxc.onrender.com/api/$1/api/health" -Method Get
     Write-Host "✓ Server is running" -ForegroundColor Green
     Write-Host ""
 } catch {

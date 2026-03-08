@@ -59,7 +59,7 @@ npm start
 npm run dev
 ```
 
-Server will start on `http://localhost:5000`
+Server will start on `https://backend-7cxc.onrender.com/api/$1`
 
 ## 📡 API Endpoint
 
@@ -159,7 +159,7 @@ Safe travels with SafariTix!
 
 **Test main menu:**
 ```bash
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "TEST123",
@@ -171,7 +171,7 @@ curl -X POST http://localhost:5000/api/ussd \
 
 **Test booking flow (destination selection):**
 ```bash
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "TEST123",
@@ -182,7 +182,7 @@ curl -X POST http://localhost:5000/api/ussd \
 
 **Test complete booking (confirm):**
 ```bash
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{
     "sessionId": "TEST123",
@@ -193,7 +193,7 @@ curl -X POST http://localhost:5000/api/ussd \
 
 ### Option 2: Using Postman
 
-1. Create POST request to `http://localhost:5000/api/ussd`
+1. Create POST request to `https://backend-7cxc.onrender.com/api/$1/api/ussd`
 2. Set Header: `Content-Type: application/json`
 3. Body (raw JSON):
 ```json

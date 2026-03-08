@@ -53,7 +53,7 @@ node app.js
 
 # Test USSD booking
 $body = '{"sessionId":"TEST1","serviceCode":"*384#","phoneNumber":"+250788123456","text":"1"}'
-Invoke-RestMethod -Uri http://localhost:5000/api/ussd -Method POST -Body $body -ContentType 'application/json'
+Invoke-RestMethod -Uri https://backend-7cxc.onrender.com/api/$1/api/ussd -Method POST -Body $body -ContentType 'application/json'
 ```
 
 ### Test Results

@@ -184,7 +184,7 @@ DATABASE_URL=postgresql://user:pass@host:5432/dbname
 
 # Server
 PORT=5000
-APP_URL=http://localhost:5000
+APP_URL=https://backend-7cxc.onrender.com/api/$1
 
 # Seat Lock Configuration
 SEAT_LOCK_MINUTES=7
@@ -248,12 +248,12 @@ This will test:
 
 ```bash
 # Test main menu
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{"sessionId":"123","serviceCode":"*384#","phoneNumber":"+250788123456","text":""}'
 
 # Test booking flow - view routes
-curl -X POST http://localhost:5000/api/ussd \
+curl -X POST https://backend-7cxc.onrender.com/api/$1/api/ussd \
   -H "Content-Type: application/json" \
   -d '{"sessionId":"123","serviceCode":"*384#","phoneNumber":"+250788123456","text":"1"}'
 ```
