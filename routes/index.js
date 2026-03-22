@@ -14,6 +14,7 @@ const liveTrackingRoutes = require('./liveTracking');
 const ussdRoutes = require('./ussd');
 const ruraRoutesRoutes = require('./ruraRoutes');
 const sharedRoutes = require('./shared');
+const complaintsRoutes = require('./complaints');
 const sharedRouteController = require('../controllers/sharedRouteController');
 const ticketVerificationController = require('../controllers/ticketVerificationController');
 const publicController = require('../controllers/publicController');
@@ -33,6 +34,7 @@ router.use('/tracking', liveTrackingRoutes);
 router.use('/ussd', ussdRoutes);
 router.use('/rura_routes', ruraRoutesRoutes);
 router.use('/shared', sharedRoutes);
+router.use('/complaints', complaintsRoutes);
 
 // Smart segmented booking APIs (From -> To -> Date)
 router.get('/stops', sharedRouteController.getAvailableStops);

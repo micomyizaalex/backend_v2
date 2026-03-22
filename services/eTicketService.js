@@ -144,6 +144,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
     console.log('📱 QR code will be shown:', qrCodeImage ? 'YES' : 'NO (showing fallback)');
     
     const ticketId = `STX-${new Date().getFullYear()}-${String(ticket.id).substring(0, 6).toUpperCase()}`;
+    const ticketIdsDisplay = ticket.ticketIds || ticket.id;
   
   return `
 <!DOCTYPE html>
@@ -190,8 +191,8 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
               <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
                 <tr>
                   <td style="text-align: left;">
-                    <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Ticket ID</p>
-                    <p style="margin: 5px 0 0 0; color: #0077B6; font-size: 18px; font-weight: bold; font-family: 'Courier New', monospace;">${ticketId}</p>
+                    <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Ticket ID(s)</p>
+                    <p style="margin: 5px 0 0 0; color: #0077B6; font-size: 18px; font-weight: bold; font-family: 'Courier New', monospace;">${ticketIdsDisplay}</p>
                   </td>
                   <td style="text-align: right;">
                     <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Booking Ref</p>
@@ -202,6 +203,14 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
             </td>
           </tr>
           
+          <!-- Greeting -->
+          <tr>
+            <td style="padding: 22px 40px 0 40px;">
+              <p style="margin: 0; color: #2B2D42; font-size: 15px; line-height: 1.5;">Hello ${passenger.name},</p>
+              <p style="margin: 8px 0 0 0; color: #475569; font-size: 14px; line-height: 1.6;">Your SafariTix booking is confirmed. Please find your ticket details below.</p>
+            </td>
+          </tr>
+
           <!-- Passenger Information -->
           <tr>
             <td style="padding: 30px 40px; border-bottom: 1px solid #E2E8F0;">
@@ -294,7 +303,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
                 <tr>
                   <td style="width: 50%; padding: 12px 8px 12px 0; vertical-align: top;">
                     <div style="background-color: #FFFFFF; padding: 15px; border-radius: 8px; border-left: 4px solid #27AE60; height: 100%; box-sizing: border-box;">
-                      <p style="margin: 0 0 5px 0; color: #64748B; font-size: 11px; text-transform: uppercase; font-weight: 600;">Seat Number</p>
+                      <p style="margin: 0 0 5px 0; color: #64748B; font-size: 11px; text-transform: uppercase; font-weight: 600;">Seat Number(s)</p>
                       <p style="margin: 0; color: #27AE60; font-size: 20px; font-weight: bold;">${ticket.seatNumber}</p>
                     </div>
                   </td>
@@ -368,7 +377,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
                       <tr>
                         <td align="center" style="padding: 15px; background-color: #FFFFFF; border-radius: 12px; border: 2px solid #0077B6;">
                           <img src="${qrCodeImage}" alt="Boarding Pass QR Code" width="140" height="140" border="0" style="display: block; width: 140px; height: 140px; margin: 0 auto;" />
-                          <p style="margin: 10px 0 0 0; color: #64748B; font-size: 11px; font-weight: 600;">Scan at boarding</p>
+                          <p style="margin: 10px 0 0 0; color: #64748B; font-size: 11px; font-weight: 600;">Please present this QR code when boarding</p>
                         </td>
                       </tr>
                     </table>
@@ -501,6 +510,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
  */
 const generateETicketText = ({ ticket, passenger, trip, company }) => {
   const ticketId = `STX-${new Date().getFullYear()}-${String(ticket.id).substring(0, 6).toUpperCase()}`;
+  const ticketIdsDisplay = ticket.ticketIds || ticket.id;
   
   // Safe date formatting for plain text
   const formattedDate = formatDate(trip.date);
@@ -514,9 +524,12 @@ const generateETicketText = ({ ticket, passenger, trip, company }) => {
 
 ✓ BOOKING CONFIRMED
 
+Hello ${passenger.name},
+Your SafariTix booking is confirmed.
+
 TICKET INFORMATION
 ──────────────────────────────────────────────────────────
-Ticket ID:       ${ticketId}
+Ticket ID(s):    ${ticketIdsDisplay}
 Booking Ref:     ${ticket.bookingRef}
 Status:          CONFIRMED
 
@@ -531,7 +544,7 @@ JOURNEY DETAILS
 Route:           ${trip.origin} → ${trip.destination}
 Date:            ${formattedDate}
 Departure:       ${formattedTime}
-Seat Number:     ${ticket.seatNumber}
+Seat Number(s):  ${ticket.seatNumber}
 Bus Number:      ${trip.busNumber || 'Will be assigned'}
 ${trip.driverName ? `Driver:          ${trip.driverName}\n` : ''}
 
@@ -545,6 +558,7 @@ IMPORTANT BOARDING INFORMATION
 ──────────────────────────────────────────────────────────
 ⚠ Please arrive at least 30 minutes before departure time
 ⚠ Have this ticket ready for verification
+⚠ Please present this QR code when boarding
 ⚠ Carry a valid ID for identification
 ⚠ Luggage restrictions apply as per company policy
 ⚠ Ticket is non-transferable
@@ -587,9 +601,16 @@ const sendETicketEmail = async ({
       return { success: false, error: 'No tickets provided' };
     }
 
-    // For now, send individual emails for each ticket
-    // In production, you might want to combine multiple tickets into one email
     const ticket = tickets[0];
+    const seatNumbers = tickets
+      .map((item) => item?.seat_number || item?.seatNumber)
+      .filter(Boolean)
+      .map((seat) => String(seat));
+    const ticketIds = tickets
+      .map((item) => item?.id)
+      .filter(Boolean)
+      .map((id) => String(id));
+    const totalPrice = tickets.reduce((sum, item) => sum + Number(item?.price || 0), 0);
     
     console.log('🎫 Processing ticket:', {
       id: ticket.id,
@@ -642,9 +663,10 @@ const sendETicketEmail = async ({
     // Prepare ticket data for template
     const ticketData = {
       id: ticket.id || `temp-${Date.now()}`,
+      ticketIds: ticketIds.join(', '),
       bookingRef: ticket.booking_ref || ticket.bookingRef,
-      seatNumber: ticket.seat_number || ticket.seatNumber,
-      price: ticket.price || 0
+      seatNumber: seatNumbers.length ? seatNumbers.join(', ') : (ticket.seat_number || ticket.seatNumber),
+      price: totalPrice || ticket.price || 0
     };
 
     const passengerData = {
@@ -697,7 +719,7 @@ const sendETicketEmail = async ({
       company: companyData
     });
 
-    const subject = `🎫 SafariTix E-Ticket: ${tripData.origin} → ${tripData.destination} | Seat ${ticketData.seatNumber}`;
+    const subject = 'Your SafariTix Ticket Confirmation';
     
     console.log('📬 Sending email...');
     console.log('   To:', userEmail);

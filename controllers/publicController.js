@@ -1,6 +1,7 @@
 const { Schedule, Route, Bus, Company, Driver, Location, Ticket } = require('../models');
 const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
+const NotificationService = require('../services/notificationService');
 
 /**
  * PUBLIC CONTROLLER - Schedule Search & Discovery
@@ -1442,6 +1443,20 @@ const cancelTicket = async (req, res) => {
 
       await client.query('COMMIT');
       client.release();
+
+      (async () => {
+        try {
+          await NotificationService.createNotification(
+            userId,
+            'Ticket Cancelled',
+            `Your ticket ${ticket.booking_ref || resolvedTicketId} was cancelled successfully.`,
+            'ticket_cancelled',
+            { relatedId: resolvedTicketId, relatedType: 'ticket' }
+          );
+        } catch (notifyErr) {
+          console.error('Cancel ticket notification error:', notifyErr.message);
+        }
+      })();
 
       res.json({ 
         success: true,

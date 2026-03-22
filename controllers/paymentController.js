@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const pool = require('../config/pgPool');
 const { sendETicketEmail } = require('../services/eTicketService');
+const NotificationService = require('../services/notificationService');
 const {
   initiateCollection,
   getCollectionStatus,
@@ -445,19 +446,61 @@ const getUserInfo = async (userId) => {
   return result.rows[0] || null;
 };
 
-const getScheduleInfoForEmail = async (scheduleId) => {
-  const result = await pool.query(
+const getScheduleInfoForEmail = async (scheduleId, meta = {}) => {
+  const schedulesResult = await pool.query(
     `
-      SELECT r.origin, r.destination, s.schedule_date, s.departure_time, b.plate_number AS bus_plate
+      SELECT
+        r.origin,
+        r.destination,
+        s.schedule_date,
+        s.departure_time,
+        b.plate_number AS bus_plate,
+        COALESCE(c.name, 'SafariTix Transport') AS company_name
       FROM schedules s
       LEFT JOIN routes r ON r.id = s.route_id
       LEFT JOIN buses b ON b.id = s.bus_id
-      WHERE s.id = $1
+      LEFT JOIN companies c ON c.id = s.company_id
+      WHERE s.id::text = $1::text
       LIMIT 1
     `,
     [scheduleId]
   );
-  return result.rows[0] || null;
+
+  if (schedulesResult.rows[0]) {
+    return schedulesResult.rows[0];
+  }
+
+  const busSchedulesResult = await pool.query(
+    `
+      SELECT
+        rr.from_location AS origin,
+        rr.to_location AS destination,
+        bs.date AS schedule_date,
+        bs.time AS departure_time,
+        b.plate_number AS bus_plate,
+        COALESCE(c.name, 'SafariTix Transport') AS company_name
+      FROM bus_schedules bs
+      LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id
+      LEFT JOIN buses b ON b.id = bs.bus_id
+      LEFT JOIN companies c ON c.id = bs.company_id
+      WHERE bs.schedule_id::text = $1::text
+      LIMIT 1
+    `,
+    [scheduleId]
+  ).catch(() => ({ rows: [] }));
+
+  if (busSchedulesResult.rows[0]) {
+    return busSchedulesResult.rows[0];
+  }
+
+  return {
+    origin: meta.from_stop || 'N/A',
+    destination: meta.to_stop || 'N/A',
+    schedule_date: meta.trip_date || null,
+    departure_time: meta.trip_time || meta.departure_time || null,
+    bus_plate: null,
+    company_name: 'SafariTix Transport',
+  };
 };
 
 const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
@@ -466,7 +509,7 @@ const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
     const user = await getUserInfo(paymentRow.user_id);
     if (!user || !user.email) return;
 
-    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id);
+    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id, paymentRow.meta || {});
     await sendETicketEmail({
       userEmail: user.email,
       userName: user.full_name || 'Valued Customer',
@@ -477,7 +520,7 @@ const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
         price: parseFloat(ticket.price || 0),
       })),
       scheduleInfo,
-      companyInfo: { name: 'SafariTix Transport' },
+      companyInfo: { name: scheduleInfo?.company_name || 'SafariTix Transport' },
     });
   } catch (error) {
     console.error('[paymentController] Failed to send payment success email:', error.message);
@@ -516,6 +559,38 @@ const isProviderAuthFailure = (error) => {
 // Finalizes held booking into confirmed ticket(s) only after successful payment.
 const createTicketAfterPayment = async ({ client, paymentRow, providerPayload }) => {
   return finalizeSuccessfulPayment(client, paymentRow, providerPayload);
+};
+
+const notifyTicketBooked = async (paymentRow, tickets) => {
+  if (!paymentRow?.user_id || !Array.isArray(tickets) || tickets.length === 0) return;
+
+  const seatPreview = tickets
+    .map((ticket) => String(ticket?.seat_number || '').trim())
+    .filter(Boolean)
+    .slice(0, 4)
+    .join(', ');
+
+  const firstRef = tickets[0]?.booking_ref || tickets[0]?.id || '';
+  const seatsLabel = seatPreview ? ` Seats: ${seatPreview}.` : '';
+
+  try {
+    await NotificationService.createNotification(
+      paymentRow.user_id,
+      'Ticket Confirmed',
+      `Your payment was successful and your ticket is confirmed.${seatsLabel} Ref: ${firstRef}`,
+      'ticket_booked',
+      {
+        relatedId: paymentRow.id,
+        relatedType: 'payment',
+        data: {
+          paymentId: paymentRow.id,
+          ticketIds: tickets.map((ticket) => ticket.id),
+        },
+      }
+    );
+  } catch (err) {
+    console.error('[paymentController] booking notification error:', err.message);
+  }
 };
 
 const insertPaymentRecord = async (client, {
@@ -1137,6 +1212,8 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
     }
   );
 
+  await notifyTicketBooked(paymentRow, tickets);
+
   return { payment: paymentResult || paymentRow, tickets };
 };
 
@@ -1416,6 +1493,8 @@ const initiatePayment = async (req, res) => {
           await client.query('COMMIT');
           client.release();
 
+          sendSuccessfulPaymentEmail(finalised.payment, finalised.tickets).catch(() => {});
+
           return res.status(200).json({
             success: true,
             payment: serializePayment(finalised.payment),
@@ -1425,7 +1504,7 @@ const initiatePayment = async (req, res) => {
               seat_number: ticket.seat_number,
               status: ticket.status,
             })),
-            message: 'Payment confirmed and ticket booked successfully.',
+            message: 'Ticket confirmed! A copy is being sent to your email.',
           });
         }
 
@@ -1480,6 +1559,8 @@ const initiatePayment = async (req, res) => {
           await client.query('COMMIT');
           client.release();
 
+          sendSuccessfulPaymentEmail(finalised.payment, finalised.tickets).catch(() => {});
+
           return res.status(200).json({
             success: true,
             payment: serializePayment(finalised.payment),
@@ -1489,7 +1570,7 @@ const initiatePayment = async (req, res) => {
               seat_number: ticket.seat_number,
               status: ticket.status,
             })),
-            message: 'Payment provider authentication failed. Booking confirmed in fallback mode.',
+            message: 'Ticket confirmed! A copy is being sent to your email.',
           });
         }
 
