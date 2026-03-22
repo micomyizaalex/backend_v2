@@ -545,9 +545,11 @@ const endTrip = async (req, res) => {
 const getLiveLocations = async (req, res) => {
   try {
     const userId = req.userId;
-    const companyId = await getUserCompanyId(userId);
+    const userRole = String(req.userRole || '').toLowerCase();
+    const isAdmin = userRole === 'admin';
+    const companyId = isAdmin ? null : await getUserCompanyId(userId);
 
-    if (!companyId) {
+    if (!isAdmin && !companyId) {
       return res.status(403).json({ error: 'No company associated with user' });
     }
 
@@ -561,6 +563,13 @@ const getLiveLocations = async (req, res) => {
       const timestampCol = colMap.hasRecordedAt
         ? 'l.recorded_at'
         : (colMap.hasUpdatedAt ? 'l.updated_at' : 'NOW()');
+
+      const queryParams = isAdmin ? [] : [companyId];
+      const whereClauses = ["bs.status = 'in_progress'"];
+      if (!isAdmin) {
+        whereClauses.unshift('bs.company_id::text = $1::text');
+      }
+      const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
 
       const locations = await client.query(
         `SELECT DISTINCT ON (l.schedule_id)
@@ -579,6 +588,7 @@ const getLiveLocations = async (req, res) => {
                 b.capacity,
                 b.status AS bus_status,
                 COALESCE(u.full_name, d.name) AS driver_name,
+                c.name AS company_name,
                 rr.from_location AS route_from,
                 rr.to_location AS route_to
          FROM live_bus_locations l
@@ -586,17 +596,18 @@ const getLiveLocations = async (req, res) => {
          LEFT JOIN buses b ON b.id::text = bs.bus_id::text
          LEFT JOIN users u ON u.id::text = b.driver_id::text
          LEFT JOIN drivers d ON d.id::text = b.driver_id::text OR d.user_id::text = b.driver_id::text
+         LEFT JOIN companies c ON c.id::text = bs.company_id::text
          LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
-         WHERE bs.company_id::text = $1::text
-           AND bs.status = 'in_progress'
+         ${whereSql}
          ORDER BY l.schedule_id, ${timestampCol} DESC`,
-        [companyId]
+        queryParams
       );
 
       console.log('[tracking] Map query executed', {
         companyId,
+        isAdmin,
         count: locations.rows.length,
-        mode: 'company-live-locations',
+        mode: isAdmin ? 'admin-live-locations' : 'company-live-locations',
       });
 
       const mapped = locations.rows.map((loc) => ({
@@ -614,6 +625,9 @@ const getLiveLocations = async (req, res) => {
         },
         driver: {
           name: loc.driver_name || null,
+        },
+        company: {
+          name: loc.company_name || null,
         },
         location: {
           latitude: parseFloat(loc.latitude),

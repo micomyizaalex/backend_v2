@@ -18,7 +18,7 @@ router.post('/driver/trip/end', authenticate, requireRoles(['driver']), endTrip)
 router.get('/driver/trip/status', authenticate, requireRoles(['driver']), getTripStatus);
 
 // Company routes - require company_admin role  
-router.get('/company/live-locations', authenticate, requireRoles(['company_admin', 'driver']), getLiveLocations);
+router.get('/company/live-locations', authenticate, requireRoles(['company_admin', 'driver', 'admin']), getLiveLocations);
 
 // Public tracking route - authorization checked in controller based on ticket/role
 router.get('/schedule/:scheduleId/location', authenticate, getScheduleLocation);

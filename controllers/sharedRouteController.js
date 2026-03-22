@@ -13,6 +13,20 @@ const toInt = (value, fallback = 0) => {
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 };
 
+const hasScheduleDeparturePassed = async (client, dateValue, timeValue) => {
+  if (!dateValue || !timeValue) return false;
+
+  const result = await client.query(
+    `
+      SELECT
+        ($1::date + $2::time) <= (NOW() AT TIME ZONE 'Africa/Kigali') AS has_departed
+    `,
+    [dateValue, timeValue]
+  );
+
+  return Boolean(result.rows[0]?.has_departed);
+};
+
 const normalizeStopName = (value) => (value || '').toString().trim().toLowerCase();
 const SEAT_HOLD_STATUSES = ['PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN'];
 let scheduleTableCache = null;   // reset to null so bus_schedules is detected after migration
@@ -573,6 +587,7 @@ const searchSharedSchedules = async (req, res) => {
               bs.id AS schedule_id,
               bs.bus_id,
               bs.route_id,
+              bs.company_id,
               bs.schedule_date AS date,
               bs.departure_time AS time,
               COALESCE(bs.total_seats, bs.available_seats + bs.booked_seats) AS capacity,
@@ -751,6 +766,7 @@ const searchTrips = async (req, res) => {
       const queryParams = [routeMatch.route_id];
 
       const dateCol = tableName === 'bus_schedules' ? 'bs.date' : 'bs.schedule_date';
+      const timeCol = tableName === 'bus_schedules' ? 'bs.time' : 'bs.departure_time';
       if (date) {
         queryParams.push(date);
         whereConditions.push(`${dateCol}::date = $${queryParams.length}::date`);
@@ -758,6 +774,17 @@ const searchTrips = async (req, res) => {
         // Without a date filter, only show upcoming schedules
         whereConditions.push(`${dateCol}::date >= CURRENT_DATE`);
       }
+
+      // Schedules are not bookable once departure time is reached.
+      whereConditions.push(
+        `(
+          ${dateCol}::date > (NOW() AT TIME ZONE 'Africa/Kigali')::date
+          OR (
+            ${dateCol}::date = (NOW() AT TIME ZONE 'Africa/Kigali')::date
+            AND ${timeCol}::time > (NOW() AT TIME ZONE 'Africa/Kigali')::time
+          )
+        )`
+      );
 
       const orderCol = tableName === 'bus_schedules' ? 'bs.date, bs.time' : 'bs.schedule_date, bs.departure_time';
       const schedulesResult = await client.query(
@@ -878,6 +905,11 @@ const getAvailableSeats = async (req, res) => {
     }
 
     const schedule = scheduleResult.rows[0];
+    const scheduleDeparted = await hasScheduleDeparturePassed(client, schedule.date, schedule.time);
+    if (scheduleDeparted) {
+      return res.status(400).json({ success: false, message: 'This trip has already departed' });
+    }
+
     const routeStops = await getStopsByRoute(client, schedule.route_id);
     if (routeStops.length < 2) {
       return res.status(400).json({ success: false, message: 'Route stops are not configured' });
@@ -984,6 +1016,12 @@ const bookSharedTicket = async (req, res) => {
     }
 
     const schedule = scheduleResult.rows[0];
+    const scheduleDeparted = await hasScheduleDeparturePassed(client, schedule.date, schedule.time);
+    if (scheduleDeparted) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'This trip has already departed' });
+    }
+
     if ((schedule.status || '').toLowerCase() === 'cancelled') {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'Schedule is cancelled' });
