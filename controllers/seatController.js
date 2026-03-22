@@ -1,6 +1,8 @@
 const { sequelize, Seat, SeatLock, Ticket, Schedule, Bus, Route } = require('../models');
 const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
+const { sendETicketEmail } = require('../services/eTicketService');
+const NotificationService = require('../services/notificationService');
 
 const LOCK_DURATION_MINUTES = parseInt(process.env.SEAT_LOCK_MINUTES || '7', 10);
 
@@ -33,56 +35,51 @@ const getSeatsForSchedule = async (req, res) => {
     
     console.log(`Tickets: CONFIRMED=${confirmedCount}, CHECKED_IN=${checkedInCount}, CANCELLED=${cancelledCount}, PENDING=${pendingCount}`);
 
-    // build a map of seat states
+    // build a map of seat states - PRODUCTION GRADE STATE NORMALIZATION
     const seatMap = seats.map((s) => {
       const seatNum = String(s.seat_number).trim();
       const isDriver = s.is_driver || false;
       
-      // Driver seats cannot be booked or locked
-      if (isDriver) {
-        return {
-          id: s.id,
-          seat_number: seatNum,
-          row: s.row,
-          col: s.col,
-          side: s.side,
-          is_window: s.is_window,
-          is_driver: true,
-          meta: s.meta,
-          state: 'DRIVER',
-          status: 'DRIVER',
-          lock_expires_at: null,
-        };
-      }
+      // Determine state with strict rules (AUTHORITATIVE SOURCE OF TRUTH)
+      let state = 'AVAILABLE'; // Default state
+      let lock_expires_at = null;
       
-      const activeLock = locks.find((l) => String(l.seat_number).trim() === seatNum && l.status === 'ACTIVE' && new Date(l.expires_at) > now);
-      // Check for both CONFIRMED and CHECKED_IN statuses
-      const confirmed = tickets.find((t) => {
-        const ticketSeatNum = String(t.seat_number).trim();
-        const match = ticketSeatNum === seatNum && (t.status === 'CONFIRMED' || t.status === 'CHECKED_IN');
-        return match;
-      });
-      let state = 'AVAILABLE';
-      if (confirmed) {
-        state = 'BOOKED';
-        console.log(`✅ Seat ${seatNum}: BOOKED (ticket ${confirmed.id}, status: ${confirmed.status})`);
-      } else if (activeLock) {
-        state = 'LOCKED';
-        console.log(`⏳ Seat ${seatNum}: LOCKED (expires: ${activeLock.expires_at})`);
+      // Rule 1: Driver seats
+      if (isDriver) {
+        state = 'DRIVER';
+      } else {
+        // Rule 2: Check for confirmed/checked-in tickets (BOOKED)
+        const confirmed = tickets.find((t) => {
+          const ticketSeatNum = String(t.seat_number).trim();
+          return ticketSeatNum === seatNum && (t.status === 'CONFIRMED' || t.status === 'CHECKED_IN');
+        });
+        
+        if (confirmed) {
+          state = 'BOOKED';
+          console.log(`✅ Seat ${seatNum}: BOOKED (ticket ${confirmed.id}, status: ${confirmed.status})`);
+        } else {
+          // Rule 3: Check for active locks (LOCKED)
+          const activeLock = locks.find((l) => 
+            String(l.seat_number).trim() === seatNum && 
+            l.status === 'ACTIVE' && 
+            new Date(l.expires_at) > now
+          );
+          
+          if (activeLock) {
+            state = 'LOCKED';
+            lock_expires_at = activeLock.expires_at;
+            console.log(`⏳ Seat ${seatNum}: LOCKED (expires: ${activeLock.expires_at})`);
+          }
+        }
       }
 
+      // Return CLEAN, NORMALIZED seat object
+      // State is ALWAYS uppercase: AVAILABLE, BOOKED, LOCKED, DRIVER
       return {
-        id: s.id,
         seat_number: seatNum,
-        row: s.row,
-        col: s.col,
-        side: s.side,
-        is_window: s.is_window,
-        is_driver: false,
-        meta: s.meta,
-        state,
-        status: state, // Add explicit status field for clarity
-        lock_expires_at: activeLock ? activeLock.expires_at : null,
+        state: state, // MANDATORY: Always present, always uppercase
+        is_driver: isDriver,
+        lock_expires_at: lock_expires_at
       };
     });
 
@@ -110,10 +107,12 @@ const getSeatsForSchedule = async (req, res) => {
     }
     console.log(`==========================================\n`);
 
+    // Return PRODUCTION-GRADE response
+    // All states are uppercase strings: AVAILABLE, BOOKED, LOCKED, DRIVER
     res.json({ 
-      seats: seatMap,
+      seats: seatMap, // Array of {seat_number: string, state: string}
       summary: {
-        total: passengerSeats.length, // Only passenger seats count
+        total: passengerSeats.length,
         available: availableSeats,
         booked: bookedSeats,
         locked: lockedSeats,
@@ -350,7 +349,77 @@ const confirmLock = async (req, res) => {
     await lock.save({ transaction: t });
 
     await t.commit();
+
     res.json({ message: 'Seat confirmed', ticket_id: ticket.id });
+
+    // Non-blocking: send e-ticket email + in-app notification
+    const confirmedUserId = ticket.passenger_id;
+    const confirmedScheduleId = ticket.schedule_id;
+    const confirmedTicket = ticket;
+    if (confirmedUserId) {
+      (async () => {
+        try {
+          const userQuery = await pool.query(
+            'SELECT email, full_name FROM users WHERE id = $1',
+            [confirmedUserId]
+          );
+          if (userQuery.rows.length === 0) return;
+          const usr = userQuery.rows[0];
+
+          const scheduleDetailsQuery = await pool.query(`
+            SELECT r.origin, r.destination, s.schedule_date, s.departure_time, b.plate_number as bus_plate, b.driver_id
+            FROM schedules s
+            LEFT JOIN routes r ON s.route_id = r.id
+            LEFT JOIN buses b ON s.bus_id = b.id
+            WHERE s.id = $1
+          `, [confirmedScheduleId]);
+          const scheduleInfo = scheduleDetailsQuery.rows[0] || null;
+
+          // E-ticket email
+          if (usr.email) {
+            await sendETicketEmail({
+              userEmail: usr.email,
+              userName: usr.full_name || 'Valued Customer',
+              tickets: [{
+                id: confirmedTicket.id,
+                seat_number: confirmedTicket.seat_number,
+                booking_ref: confirmedTicket.booking_ref,
+                price: parseFloat(confirmedTicket.price || 0)
+              }],
+              scheduleInfo,
+              companyInfo: { name: 'SafariTix Transport' }
+            }).catch(e => console.error('[confirmLock] email error:', e.message));
+          }
+
+          // In-app notification — commuter
+          const route = scheduleInfo ? `${scheduleInfo.origin} → ${scheduleInfo.destination}` : 'your trip';
+          const depDate = scheduleInfo?.schedule_date ? String(scheduleInfo.schedule_date).slice(0, 10) : '';
+          const depTime = scheduleInfo?.departure_time ? String(scheduleInfo.departure_time).slice(0, 5) : '';
+          const dateStr = depDate ? ` on ${depDate}${depTime ? ' ' + depTime : ''}` : '';
+          await NotificationService.createNotification(
+            confirmedUserId,
+            'Ticket Confirmed',
+            `Your ticket from ${route}${dateStr} is confirmed. Seat: ${confirmedTicket.seat_number || '—'}. Ref: ${confirmedTicket.booking_ref || confirmedTicket.id}`,
+            'ticket_booked',
+            { relatedId: confirmedTicket.id, relatedType: 'ticket' }
+          );
+
+          // In-app notification — driver
+          const driverId = scheduleInfo?.driver_id;
+          if (driverId) {
+            await NotificationService.createNotification(
+              driverId,
+              'New Passenger Booked',
+              `${usr.full_name || 'A passenger'} booked seat ${confirmedTicket.seat_number || '—'} on your bus for ${route}${dateStr}.`,
+              'ticket_booked',
+              { relatedId: confirmedTicket.id, relatedType: 'ticket' }
+            );
+          }
+        } catch (err) {
+          console.error('[confirmLock] post-confirm error:', err.message);
+        }
+      })();
+    }
   } catch (error) {
     await t.rollback();
     console.error(error);
@@ -442,6 +511,52 @@ const bookSeat = async (req, res) => {
     await schedule.save({ transaction: t });
 
     await t.commit();
+
+    // Send ticket confirmation email (non-blocking)
+    try {
+      const userQuery = await pool.query(
+        'SELECT email, full_name FROM users WHERE id = $1',
+        [passenger_id]
+      );
+      
+      if (userQuery.rows.length > 0) {
+        const user = userQuery.rows[0];
+        
+        // Get schedule details for email
+        const scheduleDetailsQuery = await pool.query(`
+          SELECT 
+            r.origin, 
+            r.destination, 
+            s.schedule_date,
+            s.departure_time,
+            b.plate_number as bus_plate
+          FROM schedules s
+          LEFT JOIN routes r ON s.route_id = r.id
+          LEFT JOIN buses b ON s.bus_id = b.id
+          WHERE s.id = $1
+        `, [scheduleId]);
+        
+        const scheduleInfo = scheduleDetailsQuery.rows.length > 0 ? scheduleDetailsQuery.rows[0] : null;
+        
+        // Send email
+        sendETicketEmail({
+          userEmail: user.email,
+          userName: user.full_name || 'Valued Customer',
+          tickets: [{
+            id: ticket.id,
+            seat_number: ticket.seat_number,
+            booking_ref: ticket.booking_ref,
+            price: parseFloat(ticket.price)
+          }],
+          scheduleInfo,
+          companyInfo: { name: 'SafariTix Transport' }
+        }).catch(err => {
+          console.error('[bookSeat] Failed to send ticket confirmation email (non-blocking):', err);
+        });
+      }
+    } catch (emailError) {
+      console.error('[bookSeat] Error preparing ticket confirmation email (non-blocking):', emailError);
+    }
 
     // reload ticket with associations for response
     const ticketWithSchedule = await Ticket.findByPk(ticket.id, { include: [{ model: Schedule, include: [Route] }, { model: SeatLock, as: 'lock' }] });
@@ -735,7 +850,69 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
       };
     });
 
-    // STEP 13: Return success response with booking confirmation
+    // STEP 13: Send ticket confirmation email (non-blocking)
+    console.log('[bookSeatsWithConcurrencySafety] 📧 Starting email notification process for user:', userId);
+    try {
+      const userQuery = await pool.query(
+        'SELECT email, full_name FROM users WHERE id = $1',
+        [userId]
+      );
+      
+      console.log('[bookSeatsWithConcurrencySafety] User query result:', userQuery.rows.length > 0 ? `Found user: ${userQuery.rows[0].email}` : 'No user found');
+      
+      if (userQuery.rows.length > 0) {
+        const user = userQuery.rows[0];
+        
+        if (!user.email) {
+          console.log('[bookSeatsWithConcurrencySafety] ⚠️  User has no email address in profile');
+        } else {
+          console.log('[bookSeatsWithConcurrencySafety] 📨 Preparing to send email to:', user.email);
+          
+          // Get schedule details for email
+          const scheduleDetailsQuery = await pool.query(`
+            SELECT 
+              r.origin, 
+              r.destination, 
+              s.schedule_date,
+              s.departure_time,
+              b.plate_number as bus_plate
+            FROM schedules s
+            LEFT JOIN routes r ON s.route_id = r.id
+            LEFT JOIN buses b ON s.bus_id = b.id
+            WHERE s.id = $1
+          `, [scheduleId]);
+          
+          const scheduleInfo = scheduleDetailsQuery.rows.length > 0 ? scheduleDetailsQuery.rows[0] : null;
+          console.log('[bookSeatsWithConcurrencySafety] Schedule info:', scheduleInfo ? `${scheduleInfo.origin} → ${scheduleInfo.destination}` : 'No schedule details');
+          
+          // Send email (fire and forget - don't block the response)
+          console.log('[bookSeatsWithConcurrencySafety] 🚀 Calling sendETicketEmail...');
+          sendETicketEmail({
+            userEmail: user.email,
+            userName: user.full_name || 'Valued Customer',
+            tickets: tickets.map(t => ({
+              id: t.id,
+              seat_number: t.seat_number,
+              booking_ref: t.booking_ref,
+              price: parseFloat(t.price)
+            })),
+            scheduleInfo,
+            companyInfo: { name: 'SafariTix Transport' }
+          }).then(() => {
+            console.log('[bookSeatsWithConcurrencySafety] ✅ Email sending completed successfully');
+          }).catch(err => {
+            console.error('[bookSeatsWithConcurrencySafety] ❌ Failed to send ticket confirmation email:', err.message);
+          });
+        }
+      } else {
+        console.log('[bookSeatsWithConcurrencySafety] ⚠️  User not found for email notification:', userId);
+      }
+    } catch (emailError) {
+      // Log but don't fail the booking
+      console.error('[bookSeatsWithConcurrencySafety] ❌ Error preparing ticket confirmation email (non-blocking):', emailError.message);
+    }
+
+    // STEP 14: Return success response with booking confirmation
     return res.status(201).json({
       success: true,
       message: 'Seats booked successfully',
@@ -761,7 +938,7 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
     });
 
   } catch (error) {
-    // STEP 14: Rollback transaction on any error
+    // STEP 15: Rollback transaction on any error
     await transaction.rollback();
     
     console.error('[bookSeatsWithConcurrencySafety] Error:', error);

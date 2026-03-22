@@ -5,7 +5,7 @@ async function testTicketsAPI() {
     // You'll need to replace this with a real token
     const token = 'YOUR_TOKEN_HERE';
     
-    const response = await fetch('http://localhost:5000/api/company/tickets', {
+    const response = await fetch('https://backend-7cxc.onrender.com/api/$1/api/company/tickets', {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json'

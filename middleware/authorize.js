@@ -19,11 +19,14 @@ const requireRoles = (roles = []) => (req, res, next) => {
 // Ensure current user is associated with a company and attach companyId to request
 const requireCompany = async (req, res, next) => {
   try {
-    const { User } = require('../models');
+    const { User, Company } = require('../models');
     const user = await User.findByPk(req.userId);
     if (!user) return res.status(403).json({ error: 'User not found' });
-    if (!user.company_id) return res.status(403).json({ error: 'No company associated with user' });
-    req.companyId = user.company_id;
+
+    const companyId = user.company_id || (await Company.findOne({ where: { owner_id: req.userId }, attributes: ['id'] }))?.id || null;
+    if (!companyId) return res.status(403).json({ error: 'No company associated with user' });
+
+    req.companyId = companyId;
     next();
   } catch (err) {
     res.status(400).json({ error: err.message });

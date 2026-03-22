@@ -23,9 +23,15 @@ const Notification = sequelize.define(
         'payment_received',
         'system',
         'subscription_expiring',
-        'company_approved'
+        'company_approved',
+        'subscription_upgrade_request'
       ),
       allowNull: false
+    },
+
+    user_role: {
+      type: DataTypes.STRING(50),
+      allowNull: true,
     },
     
     title: {
@@ -57,6 +63,11 @@ const Notification = sequelize.define(
       type: DataTypes.STRING,
       allowNull: true,
     },
+
+    link: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
   },
   {
     tableName: 'notifications',
@@ -64,6 +75,7 @@ const Notification = sequelize.define(
     underscored: true,
     indexes: [
       { fields: ['user_id', 'is_read'] },
+      { fields: ['user_role', 'is_read'] },
       { fields: ['created_at'] },
       { fields: ['type'] }
     ]

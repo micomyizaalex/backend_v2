@@ -49,45 +49,12 @@ CREATE TABLE IF NOT EXISTS subscription_plans (
 -- Table: subscriptions
 -- Stores individual user subscription records
 -- Each user has exactly ONE active subscription (enforced by unique constraint)
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id SERIAL PRIMARY KEY,                                    -- Auto-incrementing ID
-    user_id VARCHAR(255) UNIQUE NOT NULL,                     -- FK to users table, enforces ONE subscription per user
-    plan_name subscription_plan_name NOT NULL,                -- Current plan (Starter/Growth/Enterprise)
-    status subscription_status NOT NULL DEFAULT 'TRIAL_ACTIVE', -- Current subscription status
-    is_trial BOOLEAN NOT NULL DEFAULT TRUE,                   -- TRUE if this is a trial subscription
-    trial_start_date TIMESTAMP,                               -- When trial started (NULL if not trial)
-    trial_end_date TIMESTAMP,                                 -- When trial ends (NULL if not trial)
-    start_date TIMESTAMP NOT NULL DEFAULT NOW(),              -- When paid subscription started
-    end_date TIMESTAMP,                                       -- When subscription ends (NULL = active)
-    next_billing_date TIMESTAMP,                              -- Next payment due date
-    auto_renew BOOLEAN NOT NULL DEFAULT TRUE,                 -- Auto-renew on next billing date
-    payment_method VARCHAR(50),                               -- Payment method (M-PESA, Bank, etc.)
-    last_payment_amount NUMERIC(10, 2),                       -- Last payment amount
-    last_payment_date TIMESTAMP,                              -- Last payment timestamp
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),              -- Record creation timestamp
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),              -- Last update timestamp
-    CONSTRAINT fk_subscription_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-);
 
 -- Table: subscription_history
 -- Audit trail for all subscription changes
 -- Every status change, upgrade, downgrade, etc. is logged here
-CREATE TABLE IF NOT EXISTS subscription_history (
-    id SERIAL PRIMARY KEY,                                    -- Auto-incrementing ID
-    user_id VARCHAR(255) NOT NULL,                            -- FK to users table
-    subscription_id INTEGER,                                  -- FK to subscriptions table (NULL if subscription deleted)
-    action subscription_action NOT NULL,                      -- Type of change (CREATED, UPGRADED, etc.)
-    old_status subscription_status,                           -- Previous status (NULL for new subscriptions)
-    new_status subscription_status,                           -- New status
-    old_plan subscription_plan_name,                          -- Previous plan (NULL for new subscriptions)
-    new_plan subscription_plan_name,                          -- New plan
-    payment_amount NUMERIC(10, 2),                            -- Payment amount if applicable
-    payment_method VARCHAR(50),                               -- Payment method if applicable
-    notes TEXT,                                               -- Additional information
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),              -- When this change occurred
-    CONSTRAINT fk_history_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    CONSTRAINT fk_history_subscription FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE SET NULL
-);
+
+
 
 -- Create indexes for performance optimization
 CREATE INDEX IF NOT EXISTS idx_subscription_status ON subscriptions(status);           -- Fast status filtering

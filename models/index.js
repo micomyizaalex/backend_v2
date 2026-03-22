@@ -50,7 +50,6 @@ Bus.belongsTo(Company, { foreignKey: "company_id" });
 Bus.belongsTo(User, { foreignKey: "driver_id", as: "driver" });
 Bus.hasMany(DriverAssignment, { foreignKey: "bus_id" });
 Bus.hasMany(Journal, { foreignKey: "bus_id" });
-Bus.hasOne(LiveBusLocation, { foreignKey: "bus_id", as: "liveLocation" });
 Bus.hasMany(Schedule, { foreignKey: "bus_id" });
 Bus.hasMany(Location, { foreignKey: "bus_id" });
 Bus.hasMany(Seat, { foreignKey: "bus_id" });
@@ -108,10 +107,6 @@ Journal.belongsTo(Company, { foreignKey: "company_id" });
 Location.belongsTo(Bus, { foreignKey: "bus_id" });
 Location.belongsTo(User, { foreignKey: "driver_id", as: 'driver' });
 Location.belongsTo(Schedule, { foreignKey: "schedule_id" });
-
-// LiveBusLocation relationships
-LiveBusLocation.belongsTo(Bus, { foreignKey: "bus_id", as: "bus" });
-LiveBusLocation.belongsTo(User, { foreignKey: "driver_id", as: "driver" });
 
 // DriverLocation relationships (latest GPS for a driver)
 DriverLocation.belongsTo(User, { foreignKey: 'driver_id', as: 'driver' });

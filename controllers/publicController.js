@@ -11,11 +11,167 @@ const pool = require('../config/pgPool');
  * - Schedules with 0 passenger seats available are filtered out from search results
  * - This prevents showing "1 seat left" when only the driver seat remains
  */
+const getLatestRuraPrice = async (fromLocation, toLocation, effectiveDate) => {
+  if (!fromLocation || !toLocation) return null;
+
+  const result = await pool.query(
+    `
+      SELECT price
+      FROM rura_routes
+      WHERE status = 'active'
+        AND LOWER(TRIM(from_location)) = LOWER(TRIM($1))
+        AND LOWER(TRIM(to_location)) = LOWER(TRIM($2))
+        AND effective_date <= COALESCE($3::date, CURRENT_DATE)
+      ORDER BY effective_date DESC, created_at DESC
+      LIMIT 1
+    `,
+    [fromLocation, toLocation, effectiveDate || null]
+  );
+
+  if (!result.rows.length) return null;
+  return parseFloat(result.rows[0].price);
+};
+
+/**
+ * Query bus_schedules + rura_routes and return results in the same shape
+ * used by the public search endpoints.
+ * @param {string|null} fromPattern  SQL ILIKE pattern e.g. '%nyabugogo%', or null for "all"
+ * @param {string|null} toPattern    SQL ILIKE pattern e.g. '%musanze%', or null for "all"
+ * @param {string|null} travelDate   ISO date string 'YYYY-MM-DD', or null/'' for any date
+ */
+const searchBusSchedules = async (fromPattern, toPattern, travelDate) => {
+  const where = [
+    `COALESCE(bs.status, 'scheduled') IN ('scheduled', 'in_progress')`,
+    `UPPER(b.status::text) = 'ACTIVE'`,
+    `GREATEST(0, bs.capacity - COALESCE(bs.booked_seats, 0)) > 0`,
+  ];
+  const params = [];
+
+  if (fromPattern) { params.push(fromPattern); where.push(`rr.from_location ILIKE $${params.length}`); }
+  if (toPattern)   { params.push(toPattern);   where.push(`rr.to_location   ILIKE $${params.length}`); }
+  if (travelDate)  { params.push(travelDate);  where.push(`bs.date::date     = $${params.length}::date`); }
+
+  const query = `
+    SELECT
+      bs.schedule_id                                             AS id,
+      rr.from_location,
+      rr.to_location,
+      bs.time                                                    AS departure_time,
+      bs.date                                                    AS schedule_date,
+      rr.price,
+      bs.company_id,
+      c.name                                                     AS company_name,
+      b.plate_number                                             AS bus_plate_number,
+      bs.capacity,
+      COALESCE(bs.booked_seats, 0)                               AS booked_seats,
+      GREATEST(0, bs.capacity - COALESCE(bs.booked_seats, 0))   AS available_seats
+    FROM bus_schedules bs
+    INNER JOIN rura_routes rr ON rr.id::text = bs.route_id
+    INNER JOIN buses       b  ON b.id = bs.bus_id
+    LEFT  JOIN companies   c  ON c.id::text = bs.company_id::text
+    WHERE ${where.join(' AND ')}
+    ORDER BY bs.date ASC, bs.time ASC
+  `;
+
+  try {
+    const result = await pool.query(query, params);
+    return result.rows.map(row => ({
+      id: row.id,
+      busId: null,
+      routeFrom: row.from_location,
+      routeTo: row.to_location,
+      from_location: row.from_location,
+      to_location: row.to_location,
+      date: row.schedule_date ? String(row.schedule_date).slice(0, 10) : null,
+      schedule_date: row.schedule_date ? String(row.schedule_date).slice(0, 10) : null,
+      departureTime: row.departure_time ? String(row.departure_time).slice(0, 5) : null,
+      departure_time: row.departure_time ? String(row.departure_time).slice(0, 5) : null,
+      arrivalTime: null,
+      arrival_time: null,
+      price: parseFloat(row.price || 0),
+      seatsAvailable: parseInt(row.available_seats, 10),
+      availableSeats: parseInt(row.available_seats, 10),
+      available_seats: parseInt(row.available_seats, 10),
+      totalPassengerSeats: parseInt(row.capacity, 10),
+      totalSeats: parseInt(row.capacity, 10),
+      bookedSeats: parseInt(row.booked_seats, 10),
+      status: 'scheduled',
+      companyName: row.company_name || 'N/A',
+      company_name: row.company_name || 'N/A',
+      busPlateNumber: row.bus_plate_number || 'N/A',
+      bus_plate_number: row.bus_plate_number || 'N/A',
+      driverName: 'N/A',
+      isSharedBus: true,
+    }));
+  } catch (err) {
+    console.warn('searchBusSchedules fallback failed:', err.message);
+    return [];
+  }
+};
 
 // Get all available schedules for public booking
 const getAvailableSchedules = async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, bus_id: busId } = req.query;
+
+    if (busId) {
+      const result = await pool.query(
+        `
+          SELECT
+            bs.schedule_id AS id,
+            bs.bus_id,
+            bs.route_id,
+            bs.date,
+            bs.time,
+            bs.capacity,
+            COALESCE(bs.available_seats, GREATEST(0, bs.capacity - COALESCE(bs.booked_seats, 0))) AS available_seats,
+            COALESCE(bs.booked_seats, 0) AS booked_seats,
+            COALESCE(bs.status, 'scheduled') AS status,
+            rr.from_location,
+            rr.to_location,
+            b.plate_number,
+            b.model,
+            b.status AS bus_status
+          FROM bus_schedules bs
+          INNER JOIN buses b ON b.id = bs.bus_id
+          LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+          WHERE bs.bus_id::text = $1::text
+          ORDER BY bs.date ASC, bs.time ASC
+        `,
+        [busId]
+      );
+
+      return res.json({
+        schedules: result.rows.map((schedule) => ({
+          id: schedule.id,
+          busId: schedule.bus_id,
+          routeName: schedule.from_location && schedule.to_location ? `${schedule.from_location} → ${schedule.to_location}` : 'Unknown Route',
+          routeFrom: schedule.from_location || 'N/A',
+          routeTo: schedule.to_location || 'N/A',
+          departureLocation: schedule.from_location || 'N/A',
+          destination: schedule.to_location || 'N/A',
+          date: schedule.date,
+          tripDate: schedule.date,
+          departureTime: schedule.time,
+          arrivalTime: null,
+          seatsAvailable: parseInt(schedule.available_seats, 10) || 0,
+          totalSeats: parseInt(schedule.capacity, 10) || 0,
+          seatCapacity: parseInt(schedule.capacity, 10) || 0,
+          bookedSeats: parseInt(schedule.booked_seats, 10) || 0,
+          status: schedule.status,
+          busPlateNumber: schedule.plate_number || 'N/A',
+          busName: schedule.model || schedule.plate_number || 'N/A',
+          bus: {
+            id: schedule.bus_id,
+            plateNumber: schedule.plate_number,
+            plate_number: schedule.plate_number,
+            model: schedule.model,
+            capacity: parseInt(schedule.capacity, 10) || 0,
+            status: schedule.bus_status,
+          },
+        })),
+      });
+    }
 
     // Build where clause for schedules
     let scheduleWhere = {
@@ -104,7 +260,22 @@ const getAvailableSchedules = async (req, res) => {
       })
     );
 
-    const mapped = schedulesWithRealAvailability
+    const schedulesWithFare = await Promise.all(
+      schedulesWithRealAvailability.map(async (schedule) => {
+        const ruraPrice = await getLatestRuraPrice(
+          schedule.Route?.origin,
+          schedule.Route?.destination,
+          schedule.schedule_date
+        );
+
+        return {
+          ...schedule,
+          effectivePrice: ruraPrice !== null ? ruraPrice : parseFloat(schedule.price_per_seat || 0)
+        };
+      })
+    );
+
+    const mapped = schedulesWithFare
       .filter(s => s.realAvailableSeats > 0) // Only include schedules with real passenger seats available
       .filter(s => {
         // Exclude schedules where ticket sales are closed or departure time has passed
@@ -120,7 +291,7 @@ const getAvailableSchedules = async (req, res) => {
         date: s.schedule_date,
         departureTime: s.departure_time,
         arrivalTime: s.arrival_time,
-        price: parseFloat(s.price_per_seat || 0),
+        price: parseFloat(String(s.effectivePrice ?? s.price_per_seat ?? 0)),
         seatsAvailable: s.realAvailableSeats, // Real passenger seat count
         totalPassengerSeats: s.totalPassengerSeats,
         bookedSeats: s.totalPassengerSeats - s.realAvailableSeats,
@@ -129,7 +300,11 @@ const getAvailableSchedules = async (req, res) => {
         ticketReason: (s.ticket_status === 'CLOSED') ? 'manual' : null
       }));
 
-    res.json({ schedules: mapped });
+    // Also include schedules from the newer bus_schedules + rura_routes tables
+    const busSchedulesMapped = await searchBusSchedules(null, null, null);
+    const combined = [...mapped, ...busSchedulesMapped];
+
+    res.json({ schedules: combined });
   } catch (error) {
     console.error('Get schedules error:', error);
     res.status(500).json({ error: error.message || 'Failed to fetch schedules' });
@@ -238,7 +413,22 @@ const searchSchedules = async (req, res) => {
       })
     );
 
-    const mapped = schedulesWithRealAvailability
+    const schedulesWithFare = await Promise.all(
+      schedulesWithRealAvailability.map(async (schedule) => {
+        const ruraPrice = await getLatestRuraPrice(
+          schedule.Route?.origin,
+          schedule.Route?.destination,
+          schedule.schedule_date
+        );
+
+        return {
+          ...schedule,
+          effectivePrice: ruraPrice !== null ? ruraPrice : parseFloat(schedule.price_per_seat || 0)
+        };
+      })
+    );
+
+    const mapped = schedulesWithFare
       .filter(s => s.realAvailableSeats > 0) // Only show schedules with real passenger seats
       .filter(s => {
         if (s.ticket_status === 'CLOSED') return false;
@@ -253,7 +443,7 @@ const searchSchedules = async (req, res) => {
       date: s.schedule_date,
       departureTime: s.departure_time,
       arrivalTime: s.arrival_time,
-      price: parseFloat(s.price_per_seat || 0),
+      price: parseFloat(String(s.effectivePrice ?? s.price_per_seat ?? 0)),
       seatsAvailable: s.realAvailableSeats, // Real passenger seat count
       totalPassengerSeats: s.totalPassengerSeats,
       bookedSeats: s.realBookedSeats,
@@ -264,7 +454,13 @@ const searchSchedules = async (req, res) => {
       driverId: s.Bus?.driver_id || null
     }));
 
-    res.json({ schedules: mapped });
+    // Also search the newer bus_schedules + rura_routes tables
+    const fromPat = from ? `%${from}%` : null;
+    const toPat   = to   ? `%${to}%`   : null;
+    const busSchedulesMapped = await searchBusSchedules(fromPat, toPat, date || null);
+    const combined = [...mapped, ...busSchedulesMapped];
+
+    res.json({ schedules: combined });
   } catch (error) {
     console.error('Search schedules error:', error);
     res.status(500).json({ error: error.message || 'Failed to search schedules' });
@@ -349,6 +545,12 @@ const getScheduleById = async (req, res) => {
     const realAvailable = totalPassengerSeats - bookedSeats;
     
     const now = new Date();
+    const ruraPrice = await getLatestRuraPrice(
+      schedule.Route?.origin,
+      schedule.Route?.destination,
+      schedule.schedule_date
+    );
+    const effectivePrice = ruraPrice !== null ? ruraPrice : parseFloat(schedule.price_per_seat || 0);
     const bookable = schedule.status === 'scheduled' && schedule.ticket_status !== 'CLOSED' && (!(schedule.departure_time) || new Date(schedule.departure_time) > now) && realAvailable > 0;
     
     res.json({ schedule: {
@@ -358,7 +560,7 @@ const getScheduleById = async (req, res) => {
       date: schedule.schedule_date,
       departureTime: schedule.departure_time,
       arrivalTime: schedule.arrival_time,
-      price: parseFloat(schedule.price_per_seat || 0),
+      price: effectivePrice,
       availableSeats: realAvailable, // Real passenger seat availability
       totalPassengerSeats: totalPassengerSeats,
       bookedSeats: bookedSeats,
@@ -558,7 +760,19 @@ const searchSchedulesPg = async (req, res) => {
         s.departure_time,
         s.schedule_date,
         s.arrival_time,
-        s.price_per_seat as price,
+        COALESCE(
+          (
+            SELECT rr.price
+            FROM rura_routes rr
+            WHERE rr.status = 'active'
+              AND LOWER(TRIM(rr.from_location)) = LOWER(TRIM(r.origin))
+              AND LOWER(TRIM(rr.to_location)) = LOWER(TRIM(r.destination))
+              AND rr.effective_date <= COALESCE(s.schedule_date::date, CURRENT_DATE)
+            ORDER BY rr.effective_date DESC, rr.created_at DESC
+            LIMIT 1
+          ),
+          s.price_per_seat
+        ) as price,
         s.company_id,
         c.name as company_name,
         b.plate_number as bus_plate_number,
@@ -641,23 +855,9 @@ const searchSchedulesPg = async (req, res) => {
 
     const result = await client.query(query, queryParams);
     
-    console.log(`✅ Found ${result.rows.length} schedules with available passenger seats`);
-    
-    // Log sample result for debugging (first schedule if exists)
-    if (result.rows.length > 0) {
-      const sample = result.rows[0];
-      console.log(`📊 Sample schedule: ID=${sample.id}, Available=${sample.available_seats}, Booked=${sample.booked_seats}, Total Passenger Seats=${sample.total_passenger_seats}`);
-    }
+    console.log(`✅ Found ${result.rows.length} old-table schedules for ${fromLocation} → ${toLocation}`);
 
-    // Handle no results
-    if (!result.rows || result.rows.length === 0) {
-      return res.status(200).json({
-        schedules: [],
-        message: 'No schedules available for this route'
-      });
-    }
-
-    // Format the results
+    // Format the results from the old schedules table (may be empty)
     const schedules = result.rows.map(row => ({
       id: row.id,
       from_location: row.from_location,
@@ -683,9 +883,17 @@ const searchSchedulesPg = async (req, res) => {
       driver_name: row.driver_name || 'No driver assigned'
     }));
 
+    // Also search the newer bus_schedules + rura_routes tables
+    const busSchedulesMapped = await searchBusSchedules(
+      fromLocation ? `%${fromLocation}%` : null,
+      toLocation   ? `%${toLocation}%`   : null,
+      travelDate   || null
+    );
+    const combined = [...schedules, ...busSchedulesMapped];
+
     res.json({
-      schedules,
-      count: schedules.length
+      schedules: combined,
+      count: combined.length
     });
 
   } catch (error) {

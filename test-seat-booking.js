@@ -8,7 +8,7 @@
 require('dotenv').config();
 const fetch = require('node-fetch');
 
-const API_URL = process.env.API_URL || 'http://localhost:5000';
+const API_URL = process.env.API_URL || 'https://backend-7cxc.onrender.com/api/$1';
 
 // Test configuration
 const TEST_CONFIG = {

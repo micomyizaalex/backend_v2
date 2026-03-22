@@ -25,7 +25,7 @@ async function runMigration() {
     await client.query(sql);
     client.release();
     console.log('✅ Migration completed successfully');
-    console.log('📍 live_bus_locations table created');
+    console.log('📍 live_bus_locations table aligned for bus_schedules tracking');
   } catch (error) {
     console.error('❌ Migration failed:', error.message);
     process.exit(1);

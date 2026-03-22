@@ -67,7 +67,17 @@ const User = sequelize.define('User', {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
   },
-  
+
+  company_verified: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
+
+  account_status: {
+    type: DataTypes.STRING(50),
+    defaultValue: 'approved',
+  },
+
   last_login: {
     type: DataTypes.DATE,
     allowNull: true,
@@ -84,6 +94,12 @@ const User = sequelize.define('User', {
         promotional: false
       }
     }
+  },
+
+  permissions: {
+    type: DataTypes.JSONB,
+    allowNull: true,
+    defaultValue: {},
   },
 }, {
   tableName: 'users',

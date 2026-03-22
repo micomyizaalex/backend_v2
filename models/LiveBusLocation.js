@@ -4,13 +4,18 @@ const sequelize = require("../config/database");
 const LiveBusLocation = sequelize.define(
   "LiveBusLocation",
   {
-    schedule_id: {
+    id: {
       type: DataTypes.UUID,
       primaryKey: true,
       allowNull: false,
+      defaultValue: DataTypes.UUIDV4,
+    },
+    schedule_id: {
+      type: DataTypes.UUID,
+      allowNull: false,
       references: {
-        model: 'schedules',
-        key: 'id'
+        model: 'bus_schedules',
+        key: 'schedule_id'
       },
       onDelete: 'CASCADE'
     },
@@ -43,6 +48,8 @@ const LiveBusLocation = sequelize.define(
     timestamps: true,
     underscored: true,
     indexes: [
+      { fields: ['schedule_id', 'recorded_at'] },
+      { fields: ['schedule_id', 'updated_at'] },
       { fields: ['recorded_at'] }
     ]
   }

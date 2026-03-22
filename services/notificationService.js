@@ -1,65 +1,111 @@
 // services/notificationService.js
-const { Notification, sequelize } = require('../models');
+const sequelize = require('../config/database');
+const { Notification } = require('../models');
+const { User } = require('../models');
 
-/**
- * NotificationService
- * - notify: create a notification for a user about some notifiable model (Post, Comment, User, etc)
- * - getForUserWithNotifiable: load notifications and attach `notifiable` (resolved polymorphic model)
- * - markAsRead / markAsUnread / markAllAsRead / delete
- *
- * NOTE: notifiableModelName must match the model name used in Notification.notifiable_type
- * (e.g. 'Post', 'Comment', 'User') and must have associations declared in the Notification model:
- * Notification.belongsTo(models.Post, { as: 'post', scope: { notifiable_type: 'Post' }})
- */
+sequelize.query(`
+  ALTER TABLE notifications
+  ADD COLUMN IF NOT EXISTS user_role VARCHAR(50),
+  ADD COLUMN IF NOT EXISTS link TEXT
+`).catch((err) => console.warn('notifications schema init failed:', err.message));
+
+sequelize.query(`
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1
+      FROM pg_type t
+      JOIN pg_enum e ON t.oid = e.enumtypid
+      WHERE t.typname = 'enum_notifications_type'
+        AND e.enumlabel = 'subscription_upgrade_request'
+    ) THEN
+      RETURN;
+    END IF;
+
+    ALTER TYPE enum_notifications_type ADD VALUE 'subscription_upgrade_request';
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;
+  END $$;
+`).catch((err) => console.warn('notifications enum init failed:', err.message));
+
 class NotificationService {
-  
-  static async notify({
-    userId,
-    notifiableId = null,
-    notifiableModelName = null,
-    type = 'system',
-    message = '',
-    data = null
-  }) {
-    const payload = {
+
+  /**
+   * Create a notification.
+   * @param {string} userId
+   * @param {string} title
+   * @param {string} message
+   * @param {string} type - 'ticket_booked' | 'ticket_cancelled' | 'schedule_update' | 'payment_received' | 'system' | 'subscription_expiring' | 'company_approved'
+   * @param {object} [extra] - optional { relatedId, relatedType, data }
+   */
+  static async createNotification(userId, title, message, type = 'system', extra = {}) {
+    return Notification.create({
+      user_id: userId,
+      user_role: extra.userRole || null,
+      title,
+      message,
+      type,
+      is_read: false,
+      related_id: extra.relatedId || null,
+      related_type: extra.relatedType || null,
+      data: extra.data || null,
+      link: extra.link || null,
+    });
+  }
+
+  static async createNotificationForRole(userRole, title, message, type = 'system', extra = {}) {
+    const recipients = await User.findAll({
+      where: { role: userRole, is_active: true },
+      attributes: ['id'],
+    });
+
+    if (!recipients.length) {
+      return [];
+    }
+
+    return Promise.all(
+      recipients.map((recipient) => NotificationService.createNotification(
+        recipient.id,
+        title,
+        message,
+        type,
+        {
+          ...extra,
+          userRole,
+        }
+      ))
+    );
+  }
+
+  // Legacy polymorphic-style notify (kept for compatibility)
+  static async notify({ userId, notifiableId = null, notifiableModelName = null, type = 'system', title = '', message = '', data = null }) {
+    return Notification.create({
       user_id: userId,
       type,
+      title,
       notifiable_id: notifiableId,
       notifiable_type: notifiableModelName,
       message,
-      data
-    };
-
-    console.log(payload)
-
-    // Optionally wrap in transaction if you want to create other side-effects
-    const notification = await Notification.create(payload);
-    return notification;
+      data,
+    });
   }
 
- 
-  static async getForUserWithNotifiable(userId, { limit = 50, offset = 0 } = {}) {
-    const notifications = await Notification.findAll({
+  static async getForUser(userId, { limit = 30, offset = 0 } = {}) {
+    return Notification.findAll({
       where: { user_id: userId },
       order: [['created_at', 'DESC']],
       limit,
-      offset
+      offset,
     });
+  }
 
-    // attach resolved notifiable (calls getNotifiable() implemented on model)
-    // This is simple but causes N queries for N notifications (N+1 problem).
-    // For small pages (e.g. 20) it's acceptable. See performance note below.
-    await Promise.all(notifications.map(async (n) => {
-      try {
-        const related = await n.getNotifiable();
-        n.dataValues.notifiable = related || null;
-      } catch (err) {
-        // If association missing, set null but don't throw
-        n.dataValues.notifiable = null;
-      }
-    }));
+  // Keep old name as alias
+  static async getForUserWithNotifiable(userId, opts) {
+    return NotificationService.getForUser(userId, opts);
+  }
 
-    return notifications;
+  static async getUnreadCount(userId) {
+    return Notification.count({ where: { user_id: userId, is_read: false } });
   }
 
   static async markAsRead(notificationId) {
@@ -83,7 +129,7 @@ class NotificationService {
       { is_read: true },
       { where: { user_id: userId, is_read: false } }
     );
-    return count; // number of rows updated
+    return count;
   }
 
   static async delete(notificationId) {

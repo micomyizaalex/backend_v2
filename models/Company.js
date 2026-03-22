@@ -37,6 +37,16 @@ const Company = sequelize.define(
       type: DataTypes.TEXT,
     },
 
+    country: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
+    },
+
+    rejection_reason: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+
     logo_url: {
       type: DataTypes.TEXT,
     },
@@ -81,6 +91,17 @@ const Company = sequelize.define(
       type: DataTypes.DECIMAL(10, 2),
       defaultValue: 50000.00,
     },
+
+    plan: {
+      type: DataTypes.ENUM('Starter', 'Growth', 'Enterprise'),
+      allowNull: false,
+      defaultValue: 'Starter',
+    },
+
+    next_payment: {
+      type: DataTypes.DATEONLY,
+      allowNull: true,
+    },
   },
   {
     tableName: "companies",
@@ -89,7 +110,8 @@ const Company = sequelize.define(
     indexes: [
       { fields: ['owner_id'] },
       { fields: ['status'] },
-      { fields: ['subscription_status'] }
+      { fields: ['subscription_status'] },
+      { fields: ['plan'] }
     ]
   }
 );

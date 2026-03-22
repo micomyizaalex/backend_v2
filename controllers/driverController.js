@@ -3,6 +3,106 @@ const { User, Driver, Bus, Schedule, DriverLocation, Location } = require('../mo
 const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
 
+const OPERATIONAL_STATUS_VALUES = ['ASSIGNED', 'BOARDING', 'DEPARTED', 'ON_ROUTE', 'ARRIVING', 'COMPLETED'];
+
+let operationalStatusColumnCache = null;
+
+const buildDriverIdCandidates = async (userId) => {
+	const legacyDriver = await Driver.findOne({ where: { user_id: userId }, attributes: ['id'] });
+	const candidates = [userId];
+	if (legacyDriver?.id) candidates.push(legacyDriver.id);
+	return candidates;
+};
+
+const resolveAssignedBus = async (userId) => {
+	const user = await User.findByPk(userId, { attributes: ['id', 'company_id'] });
+	if (!user) {
+		return { error: { status: 404, body: { error: 'User not found' } } };
+	}
+
+	if (!user.company_id) {
+		return { bus: null, user };
+	}
+
+	const driverIdCandidates = await buildDriverIdCandidates(userId);
+	const DriverAssignment = require('../models').DriverAssignment;
+
+	const assignment = await DriverAssignment.findOne({
+		where: {
+			driver_id: { [Op.in]: driverIdCandidates },
+			unassigned_at: null,
+			company_id: user.company_id,
+		},
+		attributes: ['bus_id', 'assigned_at'],
+		order: [['assigned_at', 'DESC']],
+	});
+
+	let bus = null;
+	if (assignment?.bus_id) {
+		bus = await Bus.findOne({
+			where: { id: assignment.bus_id, company_id: user.company_id },
+			attributes: ['id', 'plate_number', 'model', 'capacity', 'status'],
+		});
+	}
+
+	if (!bus) {
+		bus = await Bus.findOne({
+			where: { driver_id: { [Op.in]: driverIdCandidates }, company_id: user.company_id },
+			attributes: ['id', 'plate_number', 'model', 'capacity', 'status'],
+			order: [['updated_at', 'DESC']],
+		});
+	}
+
+	return { bus, user };
+};
+
+const mapDriverSchedule = (schedule) => ({
+	id: schedule.id,
+	routeName: schedule.Route ? `${schedule.Route.origin} → ${schedule.Route.destination}` : 'Unknown Route',
+	routeFrom: schedule.Route ? schedule.Route.origin : null,
+	routeTo: schedule.Route ? schedule.Route.destination : null,
+	departureLocation: schedule.Route ? schedule.Route.origin : null,
+	destination: schedule.Route ? schedule.Route.destination : null,
+	departureTime: schedule.departure_time,
+	arrivalTime: schedule.arrival_time,
+	tripDate: schedule.schedule_date,
+	date: schedule.schedule_date,
+	seatCapacity: schedule.total_seats || schedule.Bus?.capacity || 0,
+	totalSeats: schedule.total_seats || schedule.Bus?.capacity || 0,
+	seatsAvailable: schedule.available_seats,
+	status: schedule.status,
+	bus: schedule.Bus
+		? { id: schedule.Bus.id, plateNumber: schedule.Bus.plate_number, model: schedule.Bus.model, capacity: schedule.Bus.capacity }
+		: null,
+	busName: schedule.Bus?.model || schedule.Bus?.plate_number || null,
+	busPlateNumber: schedule.Bus?.plate_number || null,
+});
+
+const fetchAssignedDriverSchedules = async (userId) => {
+	const assignment = await resolveAssignedBus(userId);
+	if (assignment.error) {
+		return assignment;
+	}
+
+	if (!assignment.user?.company_id || !assignment.bus) {
+		return { schedules: [] };
+	}
+
+	const schedules = await Schedule.findAll({
+		where: {
+			bus_id: assignment.bus.id,
+			company_id: assignment.user.company_id,
+		},
+		include: [
+			{ model: Bus, attributes: ['id', 'plate_number', 'model', 'capacity'] },
+			{ model: require('../models').Route, attributes: ['id', 'origin', 'destination'] },
+		],
+		order: [['schedule_date', 'ASC'], ['departure_time', 'ASC']],
+	});
+
+	return { schedules: await attachOperationalStatusesToSchedules(schedules.map(mapDriverSchedule)) };
+};
+
 function mapTicketRow(row) {
 	return {
 		id: row.id,
@@ -10,8 +110,11 @@ function mapTicketRow(row) {
 		bookingRef: row.booking_ref,
 		status: row.status,
 		checkedInAt: row.checked_in_at,
+		boardingTime: row.checked_in_at,
 		price: row.price ? parseFloat(row.price) : null,
 		seatNumber: row.seat_number,
+		tripId: row.schedule_id,
+		driverId: row.driver_id || null,
 		commuter: {
 			id: row.passenger_id,
 			name: row.passenger_name,
@@ -36,6 +139,363 @@ function mapTicketRow(row) {
 	};
 }
 
+async function getOperationalStatusColumns(client) {
+	if (operationalStatusColumnCache) {
+		return operationalStatusColumnCache;
+	}
+
+	const result = await client.query(
+		`SELECT table_name
+		 FROM information_schema.columns
+		 WHERE table_schema = 'public'
+		   AND column_name = 'operational_status'
+		   AND table_name = ANY($1::text[])`,
+		[['schedules', 'bus_schedules']]
+	);
+
+	operationalStatusColumnCache = {
+		schedules: false,
+		bus_schedules: false,
+	};
+
+	for (const row of result.rows) {
+		operationalStatusColumnCache[row.table_name] = true;
+	}
+
+	return operationalStatusColumnCache;
+}
+
+function normalizeOperationalStatus(baseStatus, operationalStatus) {
+	const normalizedOperationalStatus = String(operationalStatus || '').toUpperCase();
+	if (OPERATIONAL_STATUS_VALUES.includes(normalizedOperationalStatus)) {
+		return normalizedOperationalStatus;
+	}
+
+	const normalizedBaseStatus = String(baseStatus || '').toLowerCase();
+	if (normalizedBaseStatus === 'completed') {
+		return 'COMPLETED';
+	}
+
+	if (normalizedBaseStatus === 'in_progress' || normalizedBaseStatus === 'active') {
+		return 'ON_ROUTE';
+	}
+
+	return 'ASSIGNED';
+}
+
+function mapTicketBoardingStatus(ticketStatus) {
+	return String(ticketStatus || '').toUpperCase() === 'CHECKED_IN' ? 'BOARDED' : 'BOOKED';
+}
+
+async function attachOperationalStatusesToSchedules(schedules) {
+	if (!Array.isArray(schedules) || schedules.length === 0) {
+		return schedules || [];
+	}
+
+	const scheduleIds = schedules.map((schedule) => schedule.id).filter(Boolean);
+	if (scheduleIds.length === 0) {
+		return schedules;
+	}
+
+	const client = await pool.connect();
+	try {
+		const columns = await getOperationalStatusColumns(client);
+		if (!columns.schedules) {
+			return schedules.map((schedule) => ({
+				...schedule,
+				operationalStatus: normalizeOperationalStatus(schedule.status, null),
+			}));
+		}
+
+		const result = await client.query(
+			`SELECT id::text AS id, operational_status
+			 FROM schedules
+			 WHERE id = ANY($1::uuid[])`,
+			[scheduleIds]
+		);
+
+		const operationalStatusMap = new Map(result.rows.map((row) => [String(row.id), row.operational_status]));
+
+		return schedules.map((schedule) => ({
+			...schedule,
+			operationalStatus: normalizeOperationalStatus(schedule.status, operationalStatusMap.get(String(schedule.id))),
+		}));
+	} finally {
+		client.release();
+	}
+}
+
+async function resolveDriverTripRecord(client, userId, scheduleId) {
+	const assignmentResult = await resolveAssignedBus(userId);
+	if (assignmentResult.error) {
+		return { error: assignmentResult.error };
+	}
+
+	if (!assignmentResult.bus) {
+		return { error: { status: 403, body: { error: 'Unauthorized: No bus assigned to this driver' } } };
+	}
+
+	const columns = await getOperationalStatusColumns(client);
+	const scheduleResult = await client.query(
+		`SELECT id::text AS schedule_id,
+		        bus_id::text AS bus_id,
+		        company_id::text AS company_id,
+		        route_id::text AS route_id,
+		        schedule_date::date AS departure_date,
+		        departure_time::text AS departure_time,
+		        status,
+		        ${columns.schedules ? 'operational_status' : 'NULL::text AS operational_status'},
+		        'schedules'::text AS source
+		 FROM schedules
+		 WHERE id::text = $1::text
+		 UNION ALL
+		 SELECT schedule_id::text AS schedule_id,
+		        bus_id::text AS bus_id,
+		        company_id::text AS company_id,
+		        route_id::text AS route_id,
+		        date::date AS departure_date,
+		        time::text AS departure_time,
+		        status,
+		        ${columns.bus_schedules ? 'operational_status' : 'NULL::text AS operational_status'},
+		        'bus_schedules'::text AS source
+		 FROM bus_schedules
+		 WHERE schedule_id::text = $1::text
+		 LIMIT 1`,
+		[scheduleId]
+	);
+
+	if (!scheduleResult.rows.length) {
+		return { error: { status: 404, body: { error: 'Trip not found' } } };
+	}
+
+	const trip = scheduleResult.rows[0];
+	if (String(trip.bus_id) !== String(assignmentResult.bus.id)) {
+		return { error: { status: 403, body: { error: 'Unauthorized: This trip is not assigned to your bus' } } };
+	}
+
+	return {
+		trip: {
+			...trip,
+			operational_status: normalizeOperationalStatus(trip.status, trip.operational_status),
+		},
+		assignedBus: assignmentResult.bus,
+		columns,
+	};
+}
+
+async function updateOperationalStatusForTrip(client, tripRecord, columns, nextOperationalStatus) {
+	const normalizedStatus = String(nextOperationalStatus || '').toUpperCase();
+	if (!OPERATIONAL_STATUS_VALUES.includes(normalizedStatus)) {
+		throw new Error('Invalid operational trip status');
+	}
+
+	if (tripRecord.source === 'bus_schedules') {
+		if (!columns.bus_schedules) {
+			return normalizeOperationalStatus(tripRecord.status, normalizedStatus);
+		}
+
+		const result = await client.query(
+			`UPDATE bus_schedules
+			 SET operational_status = $2,
+			     updated_at = NOW()
+			 WHERE schedule_id::text = $1::text
+			 RETURNING operational_status`,
+			[tripRecord.schedule_id, normalizedStatus]
+		);
+
+		return normalizeOperationalStatus(tripRecord.status, result.rows[0]?.operational_status || normalizedStatus);
+	}
+
+	if (!columns.schedules) {
+		return normalizeOperationalStatus(tripRecord.status, normalizedStatus);
+	}
+
+	const result = await client.query(
+		`UPDATE schedules
+		 SET operational_status = $2,
+		     updated_at = NOW()
+		 WHERE id::text = $1::text
+		 RETURNING operational_status`,
+		[tripRecord.schedule_id, normalizedStatus]
+	);
+
+	return normalizeOperationalStatus(tripRecord.status, result.rows[0]?.operational_status || normalizedStatus);
+}
+
+async function insertTicketScanLog(client, payload) {
+	if (!payload?.driverId || !payload?.ticketId || !payload?.scheduleId || !payload?.passengerId) {
+		return;
+	}
+
+	await client.query(
+		`INSERT INTO ticket_scan_logs (ticket_id, driver_id, schedule_id, passenger_id, scanned_at, scan_status, error_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		[
+			payload.ticketId,
+			payload.driverId,
+			payload.scheduleId,
+			payload.passengerId,
+			payload.scannedAt || new Date(),
+			payload.scanStatus || 'SUCCESS',
+			payload.errorReason || null,
+		]
+	);
+}
+
+async function ensureLegacyDriverProfile(client, userId) {
+	const existingDriver = await client.query(
+		'READ SELECT id, user_id, company_id, name FROM drivers WHERE user_id = $1 LIMIT 1'.replace('READ ', ''),
+		[userId]
+	);
+
+	if (existingDriver.rowCount > 0) {
+		return existingDriver.rows[0];
+	}
+
+	const userResult = await client.query(
+		'SELECT id, role, company_id, full_name, email FROM users WHERE id = $1 LIMIT 1',
+		[userId]
+	);
+
+	if (userResult.rowCount === 0) {
+		return null;
+	}
+
+	const user = userResult.rows[0];
+	if (String(user.role || '').toLowerCase() !== 'driver' || !user.company_id) {
+		return null;
+	}
+
+	const generatedLicense = `DRV-AUTO-${String(user.id).replace(/-/g, '').slice(0, 12).toUpperCase()}`;
+	const inserted = await client.query(
+		`INSERT INTO drivers (id, company_id, user_id, name, license_number, phone, email, is_active, created_at, updated_at)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, NULL, $5, TRUE, NOW(), NOW())
+		 RETURNING id, user_id, company_id, name`,
+		[user.company_id, user.id, user.full_name || 'Driver', generatedLicense, user.email || null]
+	);
+
+	return inserted.rows[0] || null;
+}
+
+async function getPassengerManifest(client, scheduleId, driverId = null) {
+	const tripResult = await client.query(
+		`SELECT id::text AS schedule_id,
+		        bus_id::text AS bus_id,
+		        schedule_date::date AS departure_date,
+		        departure_time::text AS departure_time,
+		        status,
+		        route_id::text AS route_id,
+		        'schedules'::text AS source
+		 FROM schedules
+		 WHERE id::text = $1::text
+		 UNION ALL
+		 SELECT schedule_id::text AS schedule_id,
+		        bus_id::text AS bus_id,
+		        date::date AS departure_date,
+		        time::text AS departure_time,
+		        status,
+		        route_id::text AS route_id,
+		        'bus_schedules'::text AS source
+		 FROM bus_schedules
+		 WHERE schedule_id::text = $1::text
+		 LIMIT 1`,
+		[scheduleId]
+	);
+
+	const trip = tripResult.rows[0] || null;
+	const logJoinParams = driverId ? [scheduleId, driverId] : [scheduleId];
+	const logDriverClause = driverId ? 'AND tsl.driver_id = $2::uuid' : '';
+
+	const passengerResult = await client.query(
+		`SELECT t.id,
+		        t.booking_ref,
+		        t.seat_number,
+		        t.status,
+		        t.checked_in_at,
+		        t.schedule_id,
+		        COALESCE(NULLIF(TRIM(COALESCE(t.passenger_name, '')), ''), u.full_name, u.name, 'Passenger') AS passenger_name,
+		        u.id AS passenger_id,
+		        COALESCE(s.schedule_date::date, bs.date::date) AS departure_date,
+		        COALESCE(r.origin, rr.from_location, t.from_stop) AS route_from,
+		        COALESCE(r.destination, rr.to_location, t.to_stop) AS route_to,
+		        b.plate_number AS bus_plate,
+		        scan_log.driver_id AS scanned_by_driver_id,
+		        scan_log.scanned_at AS scan_time,
+		        scan_log.scan_status
+		 FROM tickets t
+		 LEFT JOIN users u ON u.id = t.passenger_id
+		 LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+		 LEFT JOIN routes r ON r.id = s.route_id
+		 LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+		 LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+		 LEFT JOIN buses b ON b.id::text = COALESCE(s.bus_id::text, bs.bus_id::text)
+		 LEFT JOIN LATERAL (
+		 	SELECT tsl.driver_id, tsl.scanned_at, tsl.scan_status
+		 	FROM ticket_scan_logs tsl
+		 	WHERE tsl.ticket_id = t.id
+		 	  AND tsl.schedule_id::text = $1::text
+		 	  ${logDriverClause}
+		 	ORDER BY tsl.scanned_at DESC
+		 	LIMIT 1
+		 ) scan_log ON TRUE
+		 WHERE t.schedule_id::text = $1::text
+		   AND UPPER(COALESCE(t.status::text, '')) NOT IN ('CANCELLED', 'EXPIRED')
+		 ORDER BY CASE WHEN t.checked_in_at IS NULL THEN 0 ELSE 1 END,
+		          t.seat_number ASC,
+		          t.booked_at ASC NULLS LAST`,
+		logJoinParams
+	);
+
+	const passengers = passengerResult.rows.map((row) => {
+		const isCheckedIn = String(row.status || '').toUpperCase() === 'CHECKED_IN';
+		const boardingTime = row.scan_time || row.checked_in_at;
+
+		return ({
+		id: row.id,
+		passengerId: row.passenger_id,
+		name: row.passenger_name,
+		seatNumber: row.seat_number,
+		ticketId: row.id,
+		bookingRef: row.booking_ref,
+		ticketStatus: isCheckedIn ? 'BOARDED' : 'BOOKED',
+		bookingStatus: row.status,
+		boardingTime,
+		scanTime: row.scan_time,
+		scanStatus: row.scan_status,
+		scannedByDriverId: row.scanned_by_driver_id,
+		routeFrom: row.route_from,
+		routeTo: row.route_to,
+		busPlate: row.bus_plate,
+		time: boardingTime ? new Date(boardingTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : null,
+		});
+	});
+	const checkedInPassengers = passengers.filter((passenger) => passenger.ticketStatus === 'BOARDED');
+	const pendingPassengers = passengers.filter((passenger) => passenger.ticketStatus !== 'BOARDED');
+
+	return {
+		trip: trip ? {
+			id: trip.schedule_id,
+			departureDate: trip.departure_date,
+			departureTime: trip.departure_time,
+			status: trip.status,
+		} : null,
+		passengers,
+		checkedInPassengers,
+		pendingPassengers,
+		stats: {
+			total: passengers.length,
+			booked: pendingPassengers.length,
+			boarded: checkedInPassengers.length,
+		},
+		meta: passengerResult.rows[0] ? {
+			routeFrom: passengerResult.rows[0].route_from,
+			routeTo: passengerResult.rows[0].route_to,
+			busPlate: passengerResult.rows[0].bus_plate,
+			departureDate: passengerResult.rows[0].departure_date,
+		} : null,
+	};
+}
+
 // Basic driver endpoints (use canonical User as driver)
 const getMe = async (req, res) => {
 	try {
@@ -49,8 +509,12 @@ const getMe = async (req, res) => {
 
 const getAssignedBus = async (req, res) => {
 	try {
-		const user = await User.findByPk(req.userId);
-		const bus = await Bus.findOne({ where: { driver_id: req.userId, company_id: user.company_id } });
+		const result = await resolveAssignedBus(req.userId);
+		if (result.error) {
+			return res.status(result.error.status).json(result.error.body);
+		}
+
+		const bus = result.bus;
 		if (!bus) return res.json({ bus: null });
 		res.json({ bus: { id: bus.id, plate_number: bus.plate_number, model: bus.model, capacity: bus.capacity, status: bus.status } });
 	} catch (err) {
@@ -125,7 +589,7 @@ const getTodaySchedule = async (req, res) => {
 			if (!seen.has(String(it.id))) { seen.add(String(it.id)); unique.push(it); }
 		}
 
-		res.json({ schedules: unique });
+		res.json({ schedules: await attachOperationalStatusesToSchedules(unique) });
 	} catch (err) {
 		res.status(400).json({ error: err.message });
 	}
@@ -134,53 +598,25 @@ const getTodaySchedule = async (req, res) => {
 // Return all schedules for buses currently assigned to the logged-in driver
 const getMyTrips = async (req, res) => {
 	try {
-		const user = await User.findByPk(req.userId);
-		if (!user) return res.status(404).json({ error: 'User not found' });
-		const companyId = user.company_id;
+		const result = await fetchAssignedDriverSchedules(req.userId);
+		if (result.error) {
+			return res.status(result.error.status).json(result.error.body);
+		}
 
-		const legacyDriver = await Driver.findOne({ where: { user_id: req.userId } });
-		const driverIdCandidates = [req.userId];
-		if (legacyDriver && legacyDriver.id) driverIdCandidates.push(legacyDriver.id);
+		res.json({ trips: result.schedules || [] });
+	} catch (err) {
+		res.status(400).json({ error: err.message });
+	}
+};
 
-		const assignments = await require('../models').DriverAssignment.findAll({
-			where: {
-				driver_id: { [Op.in]: driverIdCandidates },
-				unassigned_at: null,
-				company_id: companyId
-			},
-			attributes: ['bus_id']
-		});
+const getDriverSchedules = async (req, res) => {
+	try {
+		const result = await fetchAssignedDriverSchedules(req.userId);
+		if (result.error) {
+			return res.status(result.error.status).json(result.error.body);
+		}
 
-		const busIds = assignments.map(a => a.bus_id).filter(Boolean);
-		if (!busIds || busIds.length === 0) return res.json({ trips: [] });
-
-		const schedules = await Schedule.findAll({
-			where: {
-				bus_id: { [Op.in]: busIds },
-				company_id: companyId,
-			},
-			include: [
-				{ model: Bus, attributes: ['id','plate_number','model','capacity'] },
-				{ model: require('../models').Route, attributes: ['id','origin','destination'] }
-			],
-			order: [['schedule_date','ASC'], ['departure_time','ASC']],
-		});
-
-		const mapped = schedules.map(s => ({
-			id: s.id,
-			bus: s.Bus ? { id: s.Bus.id, plateNumber: s.Bus.plate_number, model: s.Bus.model, capacity: s.Bus.capacity } : null,
-			routeFrom: s.Route ? s.Route.origin : null,
-			routeTo: s.Route ? s.Route.destination : null,
-			departureTime: s.departure_time,
-			arrivalTime: s.arrival_time,
-			date: s.schedule_date,
-			seatsAvailable: s.available_seats,
-			totalSeats: s.Bus ? s.Bus.capacity : null,
-			price: s.price_per_seat,
-			status: s.status
-		}));
-
-		res.json({ trips: mapped });
+		res.json({ schedules: result.schedules || [] });
 	} catch (err) {
 		res.status(400).json({ error: err.message });
 	}
@@ -192,19 +628,14 @@ const getDashboard = async (req, res) => {
 	try {
 		client = await pool.connect();
 
-		// Get driver profile (legacy drivers table)
-		const driverQuery = await client.query(
-			'SELECT id, company_id FROM drivers WHERE user_id = $1',
-			[req.userId]
-		);
+		const legacyDriver = await ensureLegacyDriverProfile(client, req.userId);
 
 		let companyId;
 		const driverIdCandidates = [req.userId];
 
-		if (driverQuery.rowCount > 0) {
-			const driver = driverQuery.rows[0];
-			companyId = driver.company_id;
-			if (driver.id) driverIdCandidates.push(driver.id);
+		if (legacyDriver?.id) {
+			companyId = legacyDriver.company_id;
+			driverIdCandidates.push(legacyDriver.id);
 		} else {
 			// Fallback to users table when no legacy driver row exists
 			const userQuery = await client.query(
@@ -247,8 +678,8 @@ const getDashboard = async (req, res) => {
 		// Stats: completed and active schedules for today
 		const statsQ = await client.query(
 			`SELECT
-				 SUM(CASE WHEN LOWER(COALESCE(s.status, '')) = 'completed' THEN 1 ELSE 0 END) AS completed,
-				 SUM(CASE WHEN LOWER(COALESCE(s.status, '')) IN ('in_progress', 'active') THEN 1 ELSE 0 END) AS active
+				 SUM(CASE WHEN LOWER(COALESCE(s.status::text, '')) = 'completed' THEN 1 ELSE 0 END) AS completed,
+				 SUM(CASE WHEN LOWER(COALESCE(s.status::text, '')) IN ('in_progress', 'active') THEN 1 ELSE 0 END) AS active
 			 FROM schedules s
 			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.schedule_date >= $3 AND s.schedule_date < $4`,
@@ -271,23 +702,70 @@ const getDashboard = async (req, res) => {
 
 		const ticketsRow = ticketsQ.rows[0] || { passengers: 0, revenue: 0 };
 
-		// Upcoming trips (next 5 schedules from now)
+		// Assigned trips from both legacy schedules and shared-route bus_schedules.
 		const upcomingQ = await client.query(
-			`SELECT s.id, s.departure_time, s.arrival_time, s.schedule_date, 
-			        s.available_seats, s.price_per_seat, s.status,
-			        b.id AS bus_id, b.plate_number AS bus_plate, b.capacity AS bus_capacity,
-			        r.origin AS route_from, r.destination AS route_to
-			 FROM schedules s
-			 LEFT JOIN buses b ON s.bus_id = b.id
-			 LEFT JOIN routes r ON s.route_id = r.id
-			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
-			   AND LOWER(COALESCE(s.status, '')) IN ('scheduled', 'in_progress', 'active')
-			 ORDER BY s.schedule_date ASC, s.departure_time ASC
+			`SELECT trip.id,
+			        trip.departure_time,
+			        trip.arrival_time,
+			        trip.schedule_date,
+			        trip.available_seats,
+			        trip.price_per_seat,
+			        trip.status,
+			        trip.bus_id,
+			        trip.bus_plate,
+			        trip.bus_capacity,
+			        trip.route_from,
+			        trip.route_to,
+			        trip.source
+			 FROM (
+			 	SELECT s.id::text AS id,
+			 	       s.departure_time::text AS departure_time,
+			 	       s.arrival_time::text AS arrival_time,
+			 	       s.schedule_date::date AS schedule_date,
+			 	       s.available_seats,
+			 	       s.price_per_seat,
+			 	       s.status::text AS status,
+			 	       b.id::text AS bus_id,
+			 	       b.plate_number AS bus_plate,
+			 	       b.capacity AS bus_capacity,
+			 	       r.origin AS route_from,
+			 	       r.destination AS route_to,
+			 	       'schedules'::text AS source
+			 	FROM schedules s
+			 	LEFT JOIN buses b ON s.bus_id = b.id
+			 	LEFT JOIN routes r ON s.route_id = r.id
+			 	WHERE s.bus_id = ANY($1::uuid[])
+			 	  AND s.company_id = $2
+			 	  AND LOWER(COALESCE(s.status::text, '')) IN ('scheduled', 'in_progress', 'active')
+
+			 	UNION ALL
+
+			 	SELECT bs.schedule_id::text AS id,
+			 	       bs.time::text AS departure_time,
+			 	       NULL::text AS arrival_time,
+			 	       bs.date::date AS schedule_date,
+			 	       COALESCE(bs.available_seats, GREATEST(0, bs.capacity - COALESCE(bs.booked_seats, 0))) AS available_seats,
+			 	       NULL::numeric AS price_per_seat,
+			 	       bs.status::text AS status,
+			 	       b.id::text AS bus_id,
+			 	       b.plate_number AS bus_plate,
+			 	       b.capacity AS bus_capacity,
+			 	       rr.from_location AS route_from,
+			 	       rr.to_location AS route_to,
+			 	       'bus_schedules'::text AS source
+			 	FROM bus_schedules bs
+			 	LEFT JOIN buses b ON bs.bus_id = b.id
+			 	LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+			 	WHERE bs.bus_id = ANY($1::uuid[])
+			 	  AND COALESCE(bs.company_id::text, $2::text) = $2::text
+			 	  AND LOWER(COALESCE(bs.status::text, '')) IN ('scheduled', 'in_progress', 'active')
+			 ) trip
+			 ORDER BY trip.schedule_date ASC, trip.departure_time ASC
 			 LIMIT 5`,
 			[busIds, companyId]
 		);
 
-		const upcoming = upcomingQ.rows.map(r => ({
+		const upcoming = await attachOperationalStatusesToSchedules(upcomingQ.rows.map(r => ({
 			id: r.id,
 			routeFrom: r.route_from,
 			routeTo: r.route_to,
@@ -298,35 +776,9 @@ const getDashboard = async (req, res) => {
 			totalSeats: r.bus_capacity,
 			price: r.price_per_seat,
 			status: r.status,
+			source: r.source,
 			bus: { id: r.bus_id, plateNumber: r.bus_plate, capacity: r.bus_capacity }
-		}));
-
-		// Recent check-ins (last 10) for assigned buses - ALL checked in tickets
-		const recentQ = await client.query(
-			`SELECT t.id, t.seat_number, t.checked_in_at, 
-			        u.full_name AS passenger_name, 
-			        s.id AS schedule_id, 
-			        b.plate_number AS bus_plate
-			 FROM tickets t
-			 INNER JOIN users u ON t.passenger_id = u.id
-			 INNER JOIN schedules s ON t.schedule_id = s.id
-			 LEFT JOIN buses b ON s.bus_id = b.id
-			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
-			   AND t.status = 'CHECKED_IN'
-			 ORDER BY t.checked_in_at DESC
-			 LIMIT 10`,
-			[busIds, companyId]
-		);
-
-		const recent = recentQ.rows.map(r => ({ 
-			id: r.id, 
-			name: r.passenger_name, 
-			seat: r.seat_number, 
-			checked: true,
-			checkedAt: r.checked_in_at, 
-			busPlate: r.bus_plate,
-			time: new Date(r.checked_in_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-		}));
+		})));
 
 		const stats = {
 			completed: parseInt(statsRow.completed || 0, 10),
@@ -335,12 +787,274 @@ const getDashboard = async (req, res) => {
 			revenue: parseFloat(ticketsRow.revenue || 0)
 		};
 
-		res.json({ stats, upcoming, recentCheckins: recent });
+		const activeTrip = upcoming.find((trip) => String(trip.status || '').toLowerCase() === 'in_progress' && String(trip.source || '') === 'bus_schedules')
+			|| upcoming.find((trip) => String(trip.status || '').toLowerCase() === 'in_progress')
+			|| upcoming.find((trip) => ['BOARDING', 'DEPARTED', 'ON_ROUTE', 'ARRIVING'].includes(trip.operationalStatus))
+			|| upcoming[0]
+			|| null;
+
+		let manifest = null;
+		if (activeTrip?.id) {
+			manifest = await getPassengerManifest(client, activeTrip.id, legacyDriver?.id || null);
+		}
+
+		let recentRows = [];
+		if (activeTrip?.id && legacyDriver?.id) {
+			const activeRecentQ = await client.query(
+				`SELECT tsl.ticket_id AS id,
+				        t.booking_ref,
+				        t.seat_number,
+				        t.status,
+				        tsl.scanned_at AS checked_in_at,
+				        u.full_name AS passenger_name,
+				        tsl.schedule_id::text AS schedule_id,
+				        COALESCE(r.origin, rr.from_location, t.from_stop) AS route_from,
+				        COALESCE(r.destination, rr.to_location, t.to_stop) AS route_to,
+				        b.plate_number AS bus_plate
+				 FROM ticket_scan_logs tsl
+				 INNER JOIN tickets t ON t.id = tsl.ticket_id
+				 INNER JOIN users u ON u.id = t.passenger_id
+				 LEFT JOIN schedules s ON s.id::text = tsl.schedule_id::text
+				 LEFT JOIN routes r ON r.id = s.route_id
+				 LEFT JOIN bus_schedules bs ON bs.schedule_id::text = tsl.schedule_id::text
+				 LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+				 LEFT JOIN buses b ON b.id::text = COALESCE(s.bus_id::text, bs.bus_id::text)
+				 WHERE tsl.driver_id = $1
+				   AND tsl.schedule_id::text = $2::text
+				   AND UPPER(COALESCE(t.status::text, '')) = 'CHECKED_IN'
+				   AND LOWER(COALESCE(tsl.scan_status, 'valid')) NOT IN ('invalid', 'already_used')
+				 ORDER BY tsl.scanned_at DESC`,
+				[legacyDriver.id, activeTrip.id]
+			);
+			recentRows = activeRecentQ.rows;
+		} else if (legacyDriver?.id) {
+			const scanLogQ = await client.query(
+				`SELECT tsl.ticket_id AS id,
+				        t.booking_ref,
+				        t.seat_number,
+				        t.status,
+				        tsl.scanned_at AS checked_in_at,
+				        u.full_name AS passenger_name,
+				        tsl.schedule_id::text AS schedule_id,
+				        COALESCE(r.origin, rr.from_location, t.from_stop) AS route_from,
+				        COALESCE(r.destination, rr.to_location, t.to_stop) AS route_to,
+				        b.plate_number AS bus_plate
+				 FROM ticket_scan_logs tsl
+				 INNER JOIN tickets t ON t.id = tsl.ticket_id
+				 INNER JOIN users u ON u.id = t.passenger_id
+				 LEFT JOIN schedules s ON s.id::text = tsl.schedule_id::text
+				 LEFT JOIN routes r ON r.id = s.route_id
+				 LEFT JOIN bus_schedules bs ON bs.schedule_id::text = tsl.schedule_id::text
+				 LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+				 LEFT JOIN buses b ON b.id::text = COALESCE(s.bus_id::text, bs.bus_id::text)
+				 WHERE tsl.driver_id = $1
+				   AND UPPER(COALESCE(t.status::text, '')) = 'CHECKED_IN'
+				   AND LOWER(COALESCE(tsl.scan_status, 'valid')) NOT IN ('invalid', 'already_used')
+				 ORDER BY tsl.scanned_at DESC`,
+				[legacyDriver.id]
+			);
+			recentRows = scanLogQ.rows;
+		}
+
+		const recent = recentRows.map(r => ({ 
+			id: r.id,
+			bookingRef: r.booking_ref,
+			name: r.passenger_name,
+			seat: r.seat_number,
+			checked: true,
+			status: r.status,
+			scheduleId: r.schedule_id,
+			routeFrom: r.route_from,
+			routeTo: r.route_to,
+			checkedAt: r.checked_in_at,
+			busPlate: r.bus_plate,
+			time: r.checked_in_at ? new Date(r.checked_in_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : null,
+		}));
+
+		const recentCheckins = manifest?.checkedInPassengers?.length
+			? manifest.checkedInPassengers.map((passenger) => ({
+				id: passenger.id,
+				bookingRef: passenger.bookingRef,
+				name: passenger.name,
+				seat: passenger.seatNumber,
+				checked: true,
+				status: passenger.bookingStatus || passenger.scanStatus || 'CHECKED_IN',
+				routeFrom: passenger.routeFrom,
+				routeTo: passenger.routeTo,
+				checkedAt: passenger.boardingTime,
+				busPlate: passenger.busPlate,
+				time: passenger.time,
+			}))
+			: recent;
+
+		res.json({ stats, upcoming, activeTrip, manifest, recentCheckins, operationalStatuses: OPERATIONAL_STATUS_VALUES });
 	} catch (err) {
 		console.error('Dashboard error:', err);
 		res.status(500).json({ error: 'Failed to load dashboard', message: err.message });
 	} finally {
 		if (client) client.release();
+	}
+};
+
+const getTripPassengers = async (req, res) => {
+	let client;
+	try {
+		const scheduleId = String(req.params.scheduleId || req.query.scheduleId || '').trim();
+		if (!scheduleId) {
+			return res.status(400).json({ error: 'scheduleId is required' });
+		}
+
+		client = await pool.connect();
+		const tripResult = await resolveDriverTripRecord(client, req.userId, scheduleId);
+		if (tripResult.error) {
+			return res.status(tripResult.error.status).json(tripResult.error.body);
+		}
+
+		const manifest = await getPassengerManifest(client, scheduleId, tripResult.assignedBus ? (await ensureLegacyDriverProfile(client, req.userId))?.id || null : null);
+		return res.json({
+			scheduleId,
+			trip: {
+				...manifest.trip,
+				operationalStatus: tripResult.trip.operational_status,
+				source: tripResult.trip.source,
+			},
+			passengers: manifest.passengers,
+			checkedInPassengers: manifest.checkedInPassengers,
+			pendingPassengers: manifest.pendingPassengers,
+			stats: manifest.stats,
+			meta: manifest.meta,
+		});
+	} catch (error) {
+		console.error('Trip passengers error:', error);
+		return res.status(500).json({ error: 'Failed to load trip passengers', message: error.message });
+	} finally {
+		if (client) {
+			client.release();
+		}
+	}
+};
+
+const updateTripOperationalStatus = async (req, res) => {
+	let client;
+	try {
+		const scheduleId = String(req.body?.scheduleId || '').trim();
+		const operationalStatus = String(req.body?.operationalStatus || req.body?.status || '').trim().toUpperCase();
+
+		if (!scheduleId) {
+			return res.status(400).json({ error: 'scheduleId is required' });
+		}
+
+		if (!OPERATIONAL_STATUS_VALUES.includes(operationalStatus)) {
+			return res.status(400).json({ error: 'Invalid operationalStatus', allowedValues: OPERATIONAL_STATUS_VALUES });
+		}
+
+		client = await pool.connect();
+		await client.query('BEGIN');
+
+		const tripResult = await resolveDriverTripRecord(client, req.userId, scheduleId);
+		if (tripResult.error) {
+			await client.query('ROLLBACK');
+			return res.status(tripResult.error.status).json(tripResult.error.body);
+		}
+
+		const appliedStatus = await updateOperationalStatusForTrip(client, tripResult.trip, tripResult.columns, operationalStatus);
+		await client.query('COMMIT');
+
+		const io = req.app.get('io');
+		if (io) {
+			io.to(`schedule:${scheduleId}`).emit('trip:operationalStatus', {
+				scheduleId,
+				operationalStatus: appliedStatus,
+				updatedBy: req.userId,
+				updatedAt: new Date().toISOString(),
+			});
+		}
+
+		return res.json({
+			success: true,
+			scheduleId,
+			operationalStatus: appliedStatus,
+			allowedValues: OPERATIONAL_STATUS_VALUES,
+		});
+	} catch (error) {
+		if (client) {
+			try {
+				await client.query('ROLLBACK');
+			} catch (rollbackError) {
+				// Ignore rollback errors.
+			}
+		}
+		console.error('Update operational status error:', error);
+		return res.status(500).json({ error: 'Failed to update trip status', message: error.message });
+	} finally {
+		if (client) {
+			client.release();
+		}
+	}
+};
+
+const updateAssignedBusScheduleStatus = async (userId, scheduleId, targetStatus) => {
+	const assignmentResult = await resolveAssignedBus(userId);
+	if (assignmentResult.error) {
+		return assignmentResult.error;
+	}
+
+	if (!assignmentResult.bus) {
+		return { status: 403, body: { error: 'Unauthorized: No bus assigned to this driver' } };
+	}
+
+	const client = await pool.connect();
+	try {
+		const scheduleQuery = await client.query(
+			`SELECT schedule_id, bus_id, route_id, date, time, capacity, status
+			 FROM bus_schedules
+			 WHERE schedule_id::text = $1::text
+			 LIMIT 1`,
+			[scheduleId]
+		);
+
+		if (!scheduleQuery.rows.length) {
+			return null;
+		}
+
+		const schedule = scheduleQuery.rows[0];
+		if (String(schedule.bus_id) !== String(assignmentResult.bus.id)) {
+			return { status: 403, body: { error: 'Unauthorized: This trip is not assigned to your bus' } };
+		}
+
+		if (targetStatus === 'in_progress') {
+			if (schedule.status === 'in_progress') {
+				return { status: 400, body: { error: 'Trip already started', schedule } };
+			}
+
+			if (schedule.status === 'completed') {
+				return { status: 400, body: { error: 'Trip already completed', schedule } };
+			}
+		}
+
+		if (targetStatus === 'completed' && schedule.status !== 'in_progress') {
+			return { status: 400, body: { error: 'Trip is not in progress', currentStatus: schedule.status } };
+		}
+
+		const updated = await client.query(
+			`UPDATE bus_schedules
+			 SET status = $1,
+			     updated_at = NOW()
+			 WHERE schedule_id::text = $2::text
+			 RETURNING schedule_id, bus_id, route_id, date, time, capacity, status`,
+			[targetStatus, scheduleId]
+		);
+
+		return {
+			status: 200,
+			body: {
+				success: true,
+				message: targetStatus === 'in_progress' ? 'Trip started successfully' : 'Trip ended successfully',
+				schedule: updated.rows[0],
+			},
+		};
+	} finally {
+		client.release();
 	}
 };
 
@@ -350,6 +1064,11 @@ const startTrip = async (req, res) => {
 		
 		if (!scheduleId) {
 			return res.status(400).json({ error: 'scheduleId is required' });
+		}
+
+		const busScheduleResult = await updateAssignedBusScheduleStatus(req.userId, scheduleId, 'in_progress');
+		if (busScheduleResult) {
+			return res.status(busScheduleResult.status).json(busScheduleResult.body);
 		}
 		
 		const user = await User.findByPk(req.userId);
@@ -439,6 +1158,11 @@ const endTrip = async (req, res) => {
 		
 		if (!scheduleId) {
 			return res.status(400).json({ error: 'scheduleId is required' });
+		}
+
+		const busScheduleResult = await updateAssignedBusScheduleStatus(req.userId, scheduleId, 'completed');
+		if (busScheduleResult) {
+			return res.status(busScheduleResult.status).json(busScheduleResult.body);
 		}
 		
 		const user = await User.findByPk(req.userId);
@@ -609,29 +1333,34 @@ const scanTicket = async (req, res) => {
 	let client;
 
 	try {
-		const { qrCode } = req.body || {};
+		const { qrCode, ticketId, scheduleId } = req.body || {};
+		const rawScanValue = (typeof qrCode === 'string' && qrCode.trim()) || (typeof ticketId === 'string' && ticketId.trim()) || '';
 
-		if (!qrCode || typeof qrCode !== 'string') {
+		if (!rawScanValue) {
 			return res.status(400).json({ error: 'QR code is required', valid: false, message: 'QR code missing' });
 		}
 
+		let ticketIdentifier = rawScanValue;
+		try {
+			const parsed = JSON.parse(rawScanValue);
+			if (parsed && typeof parsed === 'object' && typeof parsed.ticketId === 'string' && parsed.ticketId.trim()) {
+				ticketIdentifier = parsed.ticketId.trim();
+			}
+		} catch (parseErr) {
+			// Keep raw QR text as identifier when payload is not JSON.
+		}
+
 		client = await pool.connect();
-
-		// Query driver profile using PostgreSQL
-		const driverQuery = await client.query(
-			'SELECT id, user_id, company_id, name FROM drivers WHERE user_id = $1',
-			[req.userId]
-		);
-
-		if (driverQuery.rowCount === 0) {
-			client.release();
+		const driver = await ensureLegacyDriverProfile(client, req.userId);
+		if (!driver?.id) {
 			return res.status(403).json({ error: 'Driver profile not found', valid: false, message: 'Driver profile missing' });
 		}
 
-		const driver = driverQuery.rows[0];
 		await client.query('BEGIN');
 
-		// Try to match by UUID id or by booking reference
+		// Try to match by UUID id or by booking reference.
+		// Tickets may reference either the legacy `schedules` table or the shared-route
+		// `bus_schedules` table, so we LEFT JOIN both and COALESCE the columns we need.
 		const ticketResult = await client.query(
 			`SELECT 
 				 t.id,
@@ -647,22 +1376,24 @@ const scanTicket = async (req, res) => {
 				 u.full_name AS passenger_name,
 				 u.email AS passenger_email,
 				 u.phone_number AS passenger_phone,
-				 s.departure_time,
-				 s.arrival_time,
-				 s.schedule_date,
-				 s.bus_id,
-				 s.status AS trip_status,
-				 r.origin AS route_from,
-				 r.destination AS route_to,
+				 COALESCE(s1.departure_time::text, s2.time::text) AS departure_time,
+				 s1.arrival_time::text AS arrival_time,
+				 COALESCE(s1.schedule_date::date, s2.date::date) AS schedule_date,
+				 COALESCE(s1.bus_id, s2.bus_id) AS bus_id,
+				 COALESCE(s1.status::text, s2.status::text) AS trip_status,
+				 COALESCE(r1.origin, rr.from_location) AS route_from,
+				 COALESCE(r1.destination, rr.to_location) AS route_to,
 				 b.plate_number AS bus_plate
 			 FROM tickets t
 			 INNER JOIN users u ON t.passenger_id = u.id
-			 INNER JOIN schedules s ON t.schedule_id = s.id
-			 INNER JOIN routes r ON s.route_id = r.id
-			 LEFT JOIN buses b ON s.bus_id = b.id
+			 LEFT JOIN schedules s1 ON s1.id = t.schedule_id
+			 LEFT JOIN routes r1 ON r1.id = s1.route_id
+			 LEFT JOIN bus_schedules s2 ON s2.schedule_id::text = t.schedule_id::text
+			 LEFT JOIN rura_routes rr ON rr.id::text = s2.route_id::text
+			 LEFT JOIN buses b ON b.id = COALESCE(s1.bus_id, s2.bus_id)
 			 WHERE t.id::text = $1 OR t.booking_ref = $1
 			 FOR UPDATE OF t`,
-			[qrCode]
+			[ticketIdentifier]
 		);
 
 		if (ticketResult.rowCount === 0) {
@@ -671,16 +1402,53 @@ const scanTicket = async (req, res) => {
 		}
 
 		const ticketRow = ticketResult.rows[0];
+		const requestedScheduleId = String(scheduleId || '').trim();
+		if (requestedScheduleId && String(ticketRow.schedule_id) !== requestedScheduleId) {
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'invalid',
+				errorReason: 'SCHEDULE_MISMATCH',
+			});
+			await client.query('COMMIT');
+			return res.status(400).json({
+				valid: false,
+				message: 'Ticket is for another trip ❌',
+				ticket: mapTicketRow(ticketRow),
+				reason: 'SCHEDULE_MISMATCH',
+			});
+		}
 
 		// Validate company match
 		if (ticketRow.company_id && ticketRow.company_id !== driver.company_id) {
-			await client.query('ROLLBACK');
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'invalid',
+				errorReason: 'COMPANY_MISMATCH',
+			});
+			await client.query('COMMIT');
 			return res.status(403).json({ error: 'Ticket not in your company', valid: false, message: 'Not for this company ❌' });
 		}
 
-		// Validate trip is active
-		if (ticketRow.trip_status !== 'in_progress' && ticketRow.trip_status !== 'ACTIVE') {
-			await client.query('ROLLBACK');
+		// Validate trip is active or scheduled.
+		// bus_schedules-based trips remain 'scheduled' until departure (no explicit start-trip flow),
+		// so we allow 'scheduled' in addition to the legacy 'in_progress'/'ACTIVE' states.
+		const allowedStatuses = ['in_progress', 'active', 'scheduled'];
+		if (!allowedStatuses.includes(String(ticketRow.trip_status || '').toLowerCase())) {
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'invalid',
+				errorReason: 'TRIP_NOT_ACTIVE',
+			});
+			await client.query('COMMIT');
 			return res.status(400).json({ 
 				valid: false, 
 				message: 'Trip not active ❌', 
@@ -691,7 +1459,15 @@ const scanTicket = async (req, res) => {
 
 		// Check if ticket is cancelled or expired
 		if (ticketRow.status === 'CANCELLED' || ticketRow.status === 'EXPIRED') {
-			await client.query('ROLLBACK');
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'invalid',
+				errorReason: 'TICKET_CANCELLED',
+			});
+			await client.query('COMMIT');
 			return res.status(400).json({ 
 				valid: false, 
 				message: 'Ticket cancelled ❌', 
@@ -702,13 +1478,27 @@ const scanTicket = async (req, res) => {
 
 		// Check if already checked in
 		if (ticketRow.status === 'CHECKED_IN') {
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'already_used',
+				errorReason: 'ALREADY_USED',
+			});
 			await client.query('COMMIT');
 			const alreadyScannedTicket = mapTicketRow(ticketRow);
 			return res.status(200).json({ 
 				valid: false, 
 				message: 'Already scanned ⚠️', 
 				ticket: alreadyScannedTicket,
-				reason: 'ALREADY_USED'
+				reason: 'ALREADY_USED',
+				passenger: {
+					name: ticketRow.passenger_name,
+					seat: ticketRow.seat_number,
+					phone: ticketRow.passenger_phone,
+					boardingStatus: 'BOARDED',
+				}
 			});
 		}
 
@@ -719,7 +1509,15 @@ const scanTicket = async (req, res) => {
 		);
 
 		if (updateResult.rowCount === 0) {
-			await client.query('ROLLBACK');
+			await insertTicketScanLog(client, {
+				driverId: driver.id,
+				ticketId: ticketRow.id,
+				scheduleId: ticketRow.schedule_id,
+				passengerId: ticketRow.passenger_id,
+				scanStatus: 'already_used',
+				errorReason: 'ALREADY_USED',
+			});
+			await client.query('COMMIT');
 			return res.status(409).json({ 
 				valid: false, 
 				message: 'Ticket already used', 
@@ -730,12 +1528,15 @@ const scanTicket = async (req, res) => {
 
 		const checkedInAt = updateResult.rows[0].checked_in_at;
 
-		// Create audit log entry
-		await client.query(
-			`INSERT INTO ticket_scan_logs (ticket_id, driver_id, schedule_id, passenger_id, scanned_at, scan_status)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			[ticketRow.id, driver.id, ticketRow.schedule_id, ticketRow.passenger_id, checkedInAt, 'SUCCESS']
-		);
+		// Create audit log entry only when a legacy driver id exists.
+		await insertTicketScanLog(client, {
+			driverId: driver.id,
+			ticketId: ticketRow.id,
+			scheduleId: ticketRow.schedule_id,
+			passengerId: ticketRow.passenger_id,
+			scannedAt: checkedInAt,
+			scanStatus: 'valid',
+		});
 
 		await client.query('COMMIT');
 
@@ -787,6 +1588,7 @@ const scanTicket = async (req, res) => {
 				name: ticketRow.passenger_name,
 				seat: ticketRow.seat_number,
 				phone: ticketRow.passenger_phone,
+				boardingStatus: 'BOARDED',
 			}
 		});
 	} catch (error) {
@@ -877,12 +1679,15 @@ module.exports = {
 	getMe,
 	getAssignedBus,
 	getTodaySchedule,
+	getTripPassengers,
+	updateTripOperationalStatus,
 	startTrip,
 	endTrip,
 	postLocation,
 	getDriverContext,
 	scanTicket,
 	shareLocation,
+	getDriverSchedules,
 	getMyTrips,
 	getDashboard,
 };
