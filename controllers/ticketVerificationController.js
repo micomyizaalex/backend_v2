@@ -12,9 +12,20 @@ const parseQrPayload = (raw) => {
   try {
     const parsed = JSON.parse(text);
     if (parsed && typeof parsed === 'object') {
+      const bookingId = parsed.bookingId || parsed.booking_id || null;
+      const userId = parsed.userId || parsed.user_id || null;
+      const from = parsed.from || null;
+      const to = parsed.to || null;
+      const seats = Array.isArray(parsed.seats) ? parsed.seats : [];
+      const date = parsed.date || null;
+      const bus = parsed.bus || null;
+
       return {
         ticketId: parsed.ticketId || parsed.ticket_id || parsed.id || parsed.bookingRef || parsed.booking_ref || null,
         tripId: parsed.tripId || parsed.trip_id || parsed.scheduleId || parsed.schedule_id || null,
+        booking: (bookingId || userId || from || to || seats.length || date || bus)
+          ? { bookingId, userId, from, to, seats, date, bus }
+          : null,
       };
     }
   } catch {
@@ -474,6 +485,7 @@ const validateTicket = async (req, res) => {
     const parsed = parseQrPayload(rawQr);
     const ticketIdentifier = parsed.ticketId;
     const qrTripId = parsed.tripId ? String(parsed.tripId).trim() : '';
+    const bookingFromQr = parsed.booking || null;
     const currentTripId = String(tripId || scheduleId || '').trim();
 
     if (!ticketIdentifier) {
@@ -646,6 +658,7 @@ const validateTicket = async (req, res) => {
       valid: true,
       reason: 'VALIDATED',
       message: 'Ticket validated',
+      booking: bookingFromQr,
       ticket: {
         id: ticket.id,
         bookingRef: ticket.booking_ref,

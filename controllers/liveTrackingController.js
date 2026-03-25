@@ -1,6 +1,89 @@
 const pool = require('../config/pgPool');
 
 let liveLocationColumnCache = null;
+const DEMO_SPEED_KMH = 36;
+const DEMO_DURATION_MINUTES = 95;
+const ROUTE_COORDINATE_HINTS = {
+  'kigali': { lat: -1.9441, lng: 30.0619 },
+  'nyabugogo': { lat: -1.9423, lng: 30.0445 },
+  'mukoto': { lat: -1.7552, lng: 30.1162 },
+  'rulindo': { lat: -1.7095, lng: 29.9949 },
+};
+
+const normalizePlaceName = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const resolveRoutePoint = (name, fallback) => {
+  const normalized = normalizePlaceName(name);
+  if (!normalized) return fallback || null;
+
+  const direct = ROUTE_COORDINATE_HINTS[normalized];
+  if (direct) return direct;
+
+  const partial = Object.entries(ROUTE_COORDINATE_HINTS).find(([key]) => normalized.includes(key));
+  if (partial) return partial[1];
+
+  return fallback || null;
+};
+
+const toRadians = (degrees) => (Number(degrees || 0) * Math.PI) / 180;
+
+const calculateDistanceKm = (from, to) => {
+  if (!from || !to) return null;
+  const earthRadiusKm = 6371;
+  const latitudeDelta = toRadians(to.lat - from.lat);
+  const longitudeDelta = toRadians(to.lng - from.lng);
+  const fromLat = toRadians(from.lat);
+  const toLat = toRadians(to.lat);
+
+  const a =
+    Math.sin(latitudeDelta / 2) * Math.sin(latitudeDelta / 2) +
+    Math.cos(fromLat) * Math.cos(toLat) *
+    Math.sin(longitudeDelta / 2) * Math.sin(longitudeDelta / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+};
+
+const buildDemoLocation = ({ fromName, toName, scheduleDate, departureTime, scheduleId }) => {
+  const fallbackStart = ROUTE_COORDINATE_HINTS.kigali;
+  const fallbackEnd = ROUTE_COORDINATE_HINTS.nyabugogo;
+  const fromPoint = resolveRoutePoint(fromName, fallbackStart);
+  const toPoint = resolveRoutePoint(toName, fallbackEnd);
+
+  const departureIso = scheduleDate
+    ? `${String(scheduleDate).slice(0, 10)}T${String(departureTime || '08:00').slice(0, 5)}:00`
+    : null;
+  const departureTimestamp = departureIso ? new Date(departureIso).getTime() : Date.now() - 15 * 60 * 1000;
+  const elapsedMs = Math.max(0, Date.now() - (Number.isFinite(departureTimestamp) ? departureTimestamp : Date.now()));
+  const totalMs = DEMO_DURATION_MINUTES * 60 * 1000;
+  const progress = Math.min(1, elapsedMs / totalMs);
+
+  const lat = fromPoint.lat + (toPoint.lat - fromPoint.lat) * progress;
+  const lng = fromPoint.lng + (toPoint.lng - fromPoint.lng) * progress;
+  const remainingKm = calculateDistanceKm({ lat, lng }, toPoint);
+  const etaMinutes = remainingKm !== null ? (remainingKm / DEMO_SPEED_KMH) * 60 : null;
+
+  return {
+    scheduleId,
+    latitude: lat,
+    longitude: lng,
+    speed: DEMO_SPEED_KMH,
+    heading: null,
+    timestamp: new Date().toISOString(),
+    source: 'demo_simulation',
+    destination: toPoint,
+    distanceRemainingKm: remainingKm,
+    etaMinutes,
+    currentLocationLabel: fromName && toName
+      ? `Between ${fromName} and ${toName}`
+      : 'On route',
+  };
+};
 
 function emitTrackingLocation(trip, storedLocation) {
   try {
@@ -894,11 +977,161 @@ const getScheduleLocation = async (req, res) => {
   }
 };
 
+/**
+ * Get bus tracking details by booking/ticket id.
+ * GET /api/tracking/booking/:bookingId/location
+ * For demo mode, returns simulated movement if no live GPS exists.
+ */
+const getBookingLocation = async (req, res) => {
+  let client;
+  try {
+    const { bookingId } = req.params;
+    if (!bookingId) {
+      return res.status(400).json({ error: 'bookingId is required' });
+    }
+
+    client = await pool.connect();
+    const ticketResult = await client.query(
+      `
+        SELECT
+          t.id,
+          t.booking_ref,
+          t.status,
+          t.schedule_id,
+          t.seat_number,
+          t.passenger_id,
+          COALESCE(r.origin, rr.from_location) AS route_from,
+          COALESCE(r.destination, rr.to_location) AS route_to,
+          COALESCE(s.schedule_date::date, bs.date::date) AS schedule_date,
+          COALESCE(s.departure_time::text, bs.time::text) AS departure_time,
+          b.id AS bus_id,
+          b.plate_number
+        FROM tickets t
+        LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+        LEFT JOIN routes r ON r.id = s.route_id
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+        LEFT JOIN buses b ON b.id = COALESCE(s.bus_id, bs.bus_id)
+        WHERE t.id::text = $1::text OR t.booking_ref = $1
+        LIMIT 1
+      `,
+      [bookingId]
+    );
+
+    const ticket = ticketResult.rows[0];
+    if (!ticket) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const confirmedStates = ['CONFIRMED', 'CHECKED_IN'];
+    const isConfirmed = confirmedStates.includes(String(ticket.status || '').toUpperCase());
+    if (!isConfirmed) {
+      return res.status(400).json({
+        error: 'Tracking available only for confirmed bookings',
+        status: ticket.status,
+      });
+    }
+
+    const schedule = {
+      schedule_id: ticket.schedule_id,
+      bus_id: ticket.bus_id,
+    };
+    const latest = await getLatestLocationForSchedule(client, schedule);
+
+    if (latest) {
+      const destination = resolveRoutePoint(ticket.route_to, null);
+      const currentPoint = {
+        lat: parseFloat(latest.latitude),
+        lng: parseFloat(latest.longitude),
+      };
+      const speed = latest.speed ? parseFloat(latest.speed) : null;
+      const distanceRemainingKm = destination ? calculateDistanceKm(currentPoint, destination) : null;
+      const etaMinutes = speed && speed > 0 && distanceRemainingKm !== null
+        ? (distanceRemainingKm / speed) * 60
+        : null;
+
+      return res.json({
+        success: true,
+        demo: false,
+        booking: {
+          id: ticket.id,
+          bookingRef: ticket.booking_ref,
+          status: ticket.status,
+          scheduleId: ticket.schedule_id,
+          busId: ticket.bus_id,
+          busPlate: ticket.plate_number,
+          from: ticket.route_from,
+          to: ticket.route_to,
+          seat: ticket.seat_number,
+        },
+        location: {
+          latitude: currentPoint.lat,
+          longitude: currentPoint.lng,
+          speed,
+          heading: latest.heading ? parseFloat(latest.heading) : null,
+          timestamp: latest.recorded_at,
+          source: 'live_gps',
+          currentLocationLabel: ticket.route_from && ticket.route_to
+            ? `Between ${ticket.route_from} and ${ticket.route_to}`
+            : 'On route',
+        },
+        calculations: {
+          distanceRemainingKm,
+          etaMinutes,
+        },
+      });
+    }
+
+    const simulated = buildDemoLocation({
+      fromName: ticket.route_from,
+      toName: ticket.route_to,
+      scheduleDate: ticket.schedule_date,
+      departureTime: ticket.departure_time,
+      scheduleId: ticket.schedule_id,
+    });
+
+    return res.json({
+      success: true,
+      demo: true,
+      booking: {
+        id: ticket.id,
+        bookingRef: ticket.booking_ref,
+        status: ticket.status,
+        scheduleId: ticket.schedule_id,
+        busId: ticket.bus_id,
+        busPlate: ticket.plate_number,
+        from: ticket.route_from,
+        to: ticket.route_to,
+        seat: ticket.seat_number,
+      },
+      location: {
+        latitude: simulated.latitude,
+        longitude: simulated.longitude,
+        speed: simulated.speed,
+        heading: simulated.heading,
+        timestamp: simulated.timestamp,
+        source: simulated.source,
+        currentLocationLabel: simulated.currentLocationLabel,
+      },
+      calculations: {
+        distanceRemainingKm: simulated.distanceRemainingKm,
+        etaMinutes: simulated.etaMinutes,
+      },
+    });
+  } catch (error) {
+    console.error('Error getting booking location:', error);
+    return res.status(500).json({ error: error.message || 'Failed to load booking location' });
+  } finally {
+    if (client) client.release();
+  }
+};
+
 module.exports = {
   updateDriverLocation,
   startTrip,
   endTrip,
   getLiveLocations,
   getTripStatus,
-  getScheduleLocation
+  getScheduleLocation,
+  getBookingLocation
 };

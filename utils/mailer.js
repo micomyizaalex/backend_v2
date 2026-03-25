@@ -24,7 +24,7 @@ try {
   console.error('❌ Failed to initialize email transporter:', e.message);
 }
 
-const sendEmail = async ({ to, subject, text, html }) => {
+const sendEmail = async ({ to, subject, text, html, attachments = [] }) => {
   if (transporter) {
     try {
       const info = await transporter.sendMail({ 
@@ -32,7 +32,8 @@ const sendEmail = async ({ to, subject, text, html }) => {
         to, 
         subject, 
         text, 
-        html 
+        html,
+        attachments
       });
       console.log('✅ Email sent successfully:', info.messageId);
       return info;
@@ -43,7 +44,7 @@ const sendEmail = async ({ to, subject, text, html }) => {
   }
   // Fallback: log the email
   console.log('⚠️  Email not sent (no transporter configured) - would have sent:');
-  console.log({ to, subject, text: text?.substring(0, 100) });
+  console.log({ to, subject, text: text?.substring(0, 100), attachmentsCount: attachments?.length || 0 });
   return Promise.resolve({ fallback: true });
 };
 

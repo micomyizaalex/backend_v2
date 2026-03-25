@@ -454,18 +454,30 @@ const buildCallbackUrl = (req) => {
   return `${protocol}://${host}/api/payments/webhook`;
 };
 
-const generateTicketQrDataUrl = async (ticket) => {
+const generateTicketQrDataUrl = async ({ ticket, bookingId, userId, scheduleInfo, seats }) => {
   try {
+    // Required QR payload schema:
+    // {
+    //   bookingId,
+    //   userId,
+    //   from,
+    //   to,
+    //   seats,
+    //   date,
+    //   bus
+    // }
+    //
+    // We also include `ticketId` to keep compatibility with existing
+    // ticket validation/scanning logic.
     const payload = {
-      ticket_id: ticket.id,
-      ticketId: ticket.id,
-      booking_ref: ticket.booking_ref,
-      schedule_id: ticket.schedule_id,
-      trip_id: ticket.schedule_id,
-      tripId: ticket.schedule_id,
-      seat_number: ticket.seat_number,
-      payment_id: ticket.payment_id,
-      issued_at: new Date().toISOString(),
+      bookingId: bookingId || null,
+      userId: userId || null,
+      from: scheduleInfo?.origin || scheduleInfo?.from || null,
+      to: scheduleInfo?.destination || scheduleInfo?.to || null,
+      seats: Array.isArray(seats) ? seats.map((s) => String(s)) : [],
+      date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || null,
+      bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || null,
+      ticketId: ticket.id || ticket.ticket_id || null,
     };
 
     return await QRCode.toDataURL(JSON.stringify(payload), {
@@ -554,14 +566,12 @@ const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
     await sendETicketEmail({
       userEmail: user.email,
       userName: user.full_name || 'Valued Customer',
-      tickets: tickets.map((ticket) => ({
-        id: ticket.id,
-        seat_number: ticket.seat_number,
-        booking_ref: ticket.booking_ref,
-        price: parseFloat(ticket.price || 0),
-      })),
+      // Pass the raw ticket rows so eTicketService can build QR payload consistently.
+      tickets,
       scheduleInfo,
       companyInfo: { name: scheduleInfo?.company_name || 'SafariTix Transport' },
+      bookingId: paymentRow.id,
+      userId: paymentRow.user_id,
     });
   } catch (error) {
     console.error('[paymentController] Failed to send payment success email:', error.message);
@@ -1093,6 +1103,26 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
   const meta = paymentRow.meta || {};
   let tickets = [];
 
+  // Some environments enforce a DB trigger that blocks ticket insert unless
+  // the linked payment is already marked paid/success.
+  // Mark payment successful first (inside the same transaction) so ticket
+  // inserts satisfy that trigger, while still keeping atomic rollback safety.
+  const preMarkedPayment = await updatePaymentCompat(
+    client,
+    paymentRow.id,
+    {
+      status: 'success',
+      booking_status: 'paid',
+      provider_status: 'success',
+      completed_at: new Date(),
+      failed_at: null,
+    },
+    {
+      prefinalised_at: new Date().toISOString(),
+    }
+  );
+  paymentRow = preMarkedPayment || paymentRow;
+
   const existingTickets = await client.query(
     'SELECT * FROM tickets WHERE payment_id = $1 ORDER BY seat_number ASC',
     [paymentRow.id]
@@ -1205,9 +1235,24 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
     }
   }
 
+  let scheduleInfoForQr = null;
+  let seatsForQr = tickets.map((t) => t.seat_number).filter(Boolean);
+  try {
+    scheduleInfoForQr = await getScheduleInfoForEmail(paymentRow.schedule_id, paymentRow.meta || {});
+  } catch (e) {
+    // QR generation should not break booking confirmation.
+    scheduleInfoForQr = null;
+  }
+
   for (const ticket of tickets) {
     if (!ticket.qr_code_url) {
-      const qrCodeUrl = await generateTicketQrDataUrl(ticket);
+      const qrCodeUrl = await generateTicketQrDataUrl({
+        ticket,
+        bookingId: paymentRow.id,
+        userId: paymentRow.user_id,
+        scheduleInfo: scheduleInfoForQr,
+        seats: seatsForQr,
+      });
       if (qrCodeUrl) {
         await client.query(
           'UPDATE tickets SET qr_code_url = $1, updated_at = NOW() WHERE id = $2',
@@ -2011,6 +2056,112 @@ const confirmPayment = async (req, res) => {
   });
 };
 
+// Demo endpoint: finalize a booking hold immediately (no external payment provider).
+// POST /api/payments/demo-confirm
+// body: { bookingId | booking_id | paymentId }
+const demoConfirmPayment = async (req, res) => {
+  let client;
+  try {
+    const userId = req.userId;
+    const paymentId = req.body?.bookingId || req.body?.booking_id || req.body?.paymentId || req.body?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (!paymentId) {
+      return res.status(400).json({ error: 'bookingId is required' });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const paymentResult = await client.query(
+      `
+        SELECT *
+        FROM payments
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+      `,
+      [paymentId, userId]
+    );
+
+    if (!paymentResult.rows.length) {
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const paymentRow = paymentResult.rows[0];
+    const now = new Date();
+
+    if (paymentRow.expires_at && new Date(paymentRow.expires_at) <= now) {
+      const failed = await finalizeFailedPayment(client, paymentRow, 'expired_before_payment', { source: 'demo_confirm' });
+      await client.query('COMMIT');
+      client.release();
+      return res.status(409).json({
+        error: 'Booking hold expired. Please select seats again.',
+        payment: serializePayment(failed.payment),
+      });
+    }
+
+    const finalised = await createTicketAfterPayment({
+      client,
+      paymentRow,
+      providerPayload: { fallback_mode: 'demo_confirm_payment', at: now.toISOString() },
+    });
+
+    await client.query('COMMIT');
+    client.release();
+
+    // Send email (fire-and-forget so API remains responsive).
+    sendSuccessfulPaymentEmail(finalised.payment, finalised.tickets).catch(() => {});
+
+    let scheduleInfo = null;
+    try {
+      scheduleInfo = await getScheduleInfoForEmail(finalised.payment.schedule_id, finalised.payment.meta || {});
+    } catch {
+      scheduleInfo = null;
+    }
+    const seats = (finalised.tickets || []).map((t) => t.seat_number).filter(Boolean);
+
+    return res.status(200).json({
+      success: true,
+      booking: {
+        bookingId: finalised.payment.id,
+        userId: finalised.payment.user_id,
+        from: scheduleInfo?.origin || scheduleInfo?.from || null,
+        to: scheduleInfo?.destination || scheduleInfo?.to || null,
+        seats,
+        date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || null,
+        bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || null,
+        departureTime: scheduleInfo?.departure_time || scheduleInfo?.departureTime || null,
+      },
+      payment: serializePayment(finalised.payment),
+      tickets: (finalised.tickets || []).map((ticket) => ({
+        id: ticket.id,
+        ticketId: ticket.id,
+        booking_ref: ticket.booking_ref,
+        bookingRef: ticket.booking_ref,
+        seat_number: ticket.seat_number,
+        seatNumber: ticket.seat_number,
+        qr_code_url: ticket.qr_code_url,
+        qrCodeUrl: ticket.qr_code_url,
+      })),
+      qrCodeUrl: finalised.tickets?.[0]?.qr_code_url || null,
+    });
+  } catch (error) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch {}
+      client.release();
+    }
+    console.error('demoConfirmPayment error:', error);
+    return res.status(500).json({
+      error: 'Failed to confirm booking in demo mode',
+      message: error?.message || 'An unexpected error occurred',
+    });
+  }
+};
+
 const failPayment = async (req, res) => {
   const paymentId = req.body.paymentId || req.body.booking_id || req.body.bookingId;
   if (!paymentId) {
@@ -2040,4 +2191,5 @@ module.exports = {
   confirmPayment,
   failPayment,
   bookTicket,
+  demoConfirmPayment,
 };

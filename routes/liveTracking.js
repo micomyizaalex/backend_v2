@@ -8,7 +8,8 @@ const {
   endTrip,
   getLiveLocations,
   getTripStatus,
-  getScheduleLocation
+  getScheduleLocation,
+  getBookingLocation
 } = require('../controllers/liveTrackingController');
 
 // Driver routes - require driver role
@@ -22,5 +23,6 @@ router.get('/company/live-locations', authenticate, requireRoles(['company_admin
 
 // Public tracking route - authorization checked in controller based on ticket/role
 router.get('/schedule/:scheduleId/location', authenticate, getScheduleLocation);
+router.get('/booking/:bookingId/location', authenticate, getBookingLocation);
 
 module.exports = router;

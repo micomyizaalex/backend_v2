@@ -6,6 +6,7 @@ const { requireCompanyVerified } = require('../middleware/requireVerified');
 
 // All payment routes require authentication
 router.post('/booking-hold', auth, paymentController.createBookingHold);
+router.post('/demo-confirm', auth, paymentController.demoConfirmPayment);
 router.post('/initiate', auth, paymentController.initiatePayment);
 router.get('/:paymentId/status', auth, paymentController.getPaymentStatus);
 router.post('/:paymentId/cancel', auth, paymentController.cancelPayment);
