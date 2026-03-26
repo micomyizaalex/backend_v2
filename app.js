@@ -31,7 +31,7 @@ const corsOptions = {
     
     const allowedOrigins = [
       'http://localhost:5173',
-      'https://backend-7cxc.onrender.com/api/$1',
+      'https://backend-v2-wjcs.onrender.com/api/$1',
       'http://127.0.0.1:5173',
       'http://127.0.0.1:5000',
       'https://africastalking.com', // Africa's Talking sandbox

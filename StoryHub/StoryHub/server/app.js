@@ -13,7 +13,7 @@ const app = express();
 
 app.use(helmet());
 const corsOptions = {
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: process.env.FRONTEND_URL || 'https://backend-v2-wjcs.onrender.com',
   credentials: true,
   optionsSuccessStatus: 200
 };
@@ -78,7 +78,7 @@ const startServer = async () => {
       console.log(`Server running on port ${PORT}`);
       console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
       console.log(`API URL: ${process.env.APP_URL || `http://localhost:${PORT}`}`);
-      console.log(`Frontend: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
+      console.log(`Frontend: ${process.env.FRONTEND_URL || 'https://backend-v2-wjcs.onrender.com'}`);
     });
     
     

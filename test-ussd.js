@@ -10,7 +10,7 @@
 const axios = require('axios');
 
 // Configuration
-const BASE_URL = 'https://backend-7cxc.onrender.com/api/$1';
+const BASE_URL = 'https://backend-v2-wjcs.onrender.com/api/$1';
 const USSD_ENDPOINT = `${BASE_URL}/api/ussd`;
 
 // Test session data
