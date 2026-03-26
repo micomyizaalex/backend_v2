@@ -559,13 +559,19 @@ const getScheduleInfoForEmail = async (scheduleId, meta = {}) => {
 const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
   try {
     if (!tickets.length) return;
+    const meta = paymentRow.meta || {};
     const user = await getUserInfo(paymentRow.user_id);
-    if (!user || !user.email) return;
+    const recipientEmail = user?.email || meta.passenger_email || null;
+    const recipientName = user?.full_name || meta.passenger_name || 'Valued Customer';
+    if (!recipientEmail) {
+      console.warn('[paymentController] Skipping ticket email because no recipient email was found for payment:', paymentRow.id);
+      return;
+    }
 
-    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id, paymentRow.meta || {});
+    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id, meta);
     await sendETicketEmail({
-      userEmail: user.email,
-      userName: user.full_name || 'Valued Customer',
+      userEmail: recipientEmail,
+      userName: recipientName,
       // Pass the raw ticket rows so eTicketService can build QR payload consistently.
       tickets,
       scheduleInfo,
@@ -713,7 +719,16 @@ const insertPaymentRecord = async (client, {
   return result.rows[0];
 };
 
-const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbers, paymentMethod, priceOverride }) => {
+const createScheduleBookingHold = async ({
+  client,
+  userId,
+  scheduleId,
+  seatNumbers,
+  paymentMethod,
+  priceOverride,
+  passengerEmail = null,
+  passengerName = null,
+}) => {
   const scheduleResult = await client.query(
     `
       SELECT
@@ -872,13 +887,27 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
     heldTicketIds,
     seatNumbers,
     expiresAt,
-    meta: { flow: 'schedule' },
+    meta: {
+      flow: 'schedule',
+      passenger_email: passengerEmail || null,
+      passenger_name: passengerName || null,
+    },
   });
 
   return payment;
 };
 
-const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumbers, paymentMethod, fromStop, toStop }) => {
+const createSegmentBookingHold = async ({
+  client,
+  userId,
+  scheduleId,
+  seatNumbers,
+  paymentMethod,
+  fromStop,
+  toStop,
+  passengerEmail = null,
+  passengerName = null,
+}) => {
   const scheduleTable = await getScheduleTableName(client);
   const scheduleResult = await client.query(
     scheduleTable === 'bus_schedules'
@@ -1083,6 +1112,8 @@ const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumber
       bus_id: schedule.bus_id,
       route_id: schedule.route_id,
       trip_date: normalizedTripDate,
+      passenger_email: passengerEmail || null,
+      passenger_name: passengerName || null,
     },
   });
 
@@ -1377,6 +1408,8 @@ const createBookingHold = async (req, res) => {
       pricePerSeat,
       fromStop,
       toStop,
+      passengerEmail,
+      passengerName,
     } = req.body;
 
     if (!userId) {
@@ -1408,6 +1441,8 @@ const createBookingHold = async (req, res) => {
           paymentMethod,
           fromStop,
           toStop,
+          passengerEmail,
+          passengerName,
         });
       } else {
         payment = await createScheduleBookingHold({
@@ -1417,6 +1452,8 @@ const createBookingHold = async (req, res) => {
           seatNumbers,
           paymentMethod,
           priceOverride: pricePerSeat,
+          passengerEmail,
+          passengerName,
         });
       }
 

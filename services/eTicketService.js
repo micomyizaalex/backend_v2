@@ -671,6 +671,25 @@ const sendETicketEmail = async ({
     // Format date and time separately for display
     const formattedDate = formatDate(scheduleDate);
     const formattedTime = formatTime(departureTime);
+
+    // Prefer the exact segment saved on the ticket over the parent route.
+    const bookedOrigin =
+      ticket?.from_stop ||
+      ticket?.fromStop ||
+      scheduleInfo?.from_stop ||
+      scheduleInfo?.pickup_stop ||
+      scheduleInfo?.origin ||
+      scheduleInfo?.from ||
+      'N/A';
+
+    const bookedDestination =
+      ticket?.to_stop ||
+      ticket?.toStop ||
+      scheduleInfo?.to_stop ||
+      scheduleInfo?.dropoff_stop ||
+      scheduleInfo?.destination ||
+      scheduleInfo?.to ||
+      'N/A';
     
     console.log('📅 Formatted date:', formattedDate);
     console.log('🕐 Formatted time:', formattedTime);
@@ -692,8 +711,8 @@ const sendETicketEmail = async ({
     const qrData = {
       bookingId: bookingId || ticket.payment_id || ticket.booking_id || ticket.booking_ref || null,
       userId: userId || ticket.passenger_id || ticket.user_id || null,
-      from: scheduleInfo?.origin || scheduleInfo?.from || 'N/A',
-      to: scheduleInfo?.destination || scheduleInfo?.to || 'N/A',
+      from: bookedOrigin,
+      to: bookedDestination,
       seats: seatNumbers.map((s) => String(s)),
       date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || scheduleDate || null,
       bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || scheduleInfo?.bus || null,
@@ -725,8 +744,8 @@ const sendETicketEmail = async ({
     };
 
     const tripData = {
-      origin: scheduleInfo?.origin || 'N/A',
-      destination: scheduleInfo?.destination || 'N/A',
+      origin: bookedOrigin,
+      destination: bookedDestination,
       date: scheduleDate, // Pass raw date for safe formatting in template
       departureTime: formattedTime, // Already formatted time
       busNumber: scheduleInfo?.bus_plate || scheduleInfo?.busNumber || null,
