@@ -1,6 +1,8 @@
 const pool = require('../config/pgPool');
 const { sendETicketEmail } = require('../services/eTicketService');
 const NotificationService = require('../services/notificationService');
+const User = require('../models/User');
+const crypto = require('crypto');
 
 const isValidDate = (value) => {
   if (!value) return false;
@@ -973,12 +975,18 @@ const bookSharedTicket = async (req, res) => {
       return res.status(400).json({ success: false, message: 'schedule_id, from_stop and to_stop are required' });
     }
 
+    const normalizedEmail = normalizeEmail(email);
+
     const requestedSeatNumbers = Array.isArray(seat_numbers)
       ? seat_numbers.map((seat) => String(seat || '').trim()).filter(Boolean)
       : (seat_number ? [String(seat_number).trim()] : []);
 
     if (requestedSeatNumbers.length > 0 && new Set(requestedSeatNumbers).size !== requestedSeatNumbers.length) {
       return res.status(400).json({ success: false, message: 'Duplicate seat numbers are not allowed' });
+    }
+
+    if (!normalizedEmail) {
+      return res.status(400).json({ success: false, message: 'email is required' });
     }
 
     client = await pool.connect();
@@ -1118,7 +1126,15 @@ const bookSharedTicket = async (req, res) => {
       return res.status(400).json({ success: false, message: 'No passenger seats available for selected segment' });
     }
 
-    const passengerId = req.userId || req.body.passenger_id || null;
+    let passengerId = req.userId || req.body.passenger_id || null;
+    if (!passengerId) {
+      const passenger = await resolveOrCreatePassenger({
+        email: normalizedEmail,
+        phone: String(phone || '').trim(),
+        passengerName: passenger_name,
+      });
+      passengerId = passenger.id;
+    }
 
     const segPrice = await getSegmentFare(client, from_stop, to_stop, schedule.date);
     if (segPrice === null) {
@@ -1141,8 +1157,7 @@ const bookSharedTicket = async (req, res) => {
     };
 
     // Always generate a UUID for 'id' — the column has no DB-level DEFAULT
-    const { randomUUID } = require('crypto');
-    add('id', randomUUID());
+    add('id', crypto.randomUUID());
     add('schedule_id', schedule.schedule_id);
     add('passenger_id', passengerId);
     add('company_id', schedule.company_id || null);
@@ -1188,7 +1203,7 @@ const bookSharedTicket = async (req, res) => {
       const createdAtIndex = localInsertCols.indexOf('created_at');
       const updatedAtIndex = localInsertCols.indexOf('updated_at');
 
-      if (idIndex >= 0) localParams[idIndex] = require('crypto').randomUUID();
+      if (idIndex >= 0) localParams[idIndex] = crypto.randomUUID();
       if (seatIndex >= 0) localParams[seatIndex] = selectedSeat;
       if (bookingRefIndex >= 0) localParams[bookingRefIndex] = `SHR-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
       if (bookedAtIndex >= 0) localParams[bookedAtIndex] = new Date();
@@ -1473,4 +1488,33 @@ module.exports = {
   bookSharedTicket,
   getUserTickets,
   updateSharedScheduleStatus
+};
+
+const normalizeEmail = (value) => String(value || '').trim().toLowerCase();
+
+const resolveOrCreatePassenger = async ({ email, phone, passengerName }) => {
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    throw new Error('Email is required to create the ticket');
+  }
+
+  const existingUser = await User.findOne({ where: { email: normalizedEmail } });
+  if (existingUser) {
+    if (phone && !existingUser.phone_number) {
+      await existingUser.update({ phone_number: phone });
+    }
+    return existingUser;
+  }
+
+  return User.create({
+    email: normalizedEmail,
+    password: `SafariTix-${crypto.randomBytes(12).toString('hex')}`,
+    full_name: passengerName || normalizedEmail.split('@')[0] || 'Mobile Passenger',
+    phone_number: phone || null,
+    role: 'commuter',
+    is_active: true,
+    email_verified: true,
+    company_verified: false,
+    account_status: 'approved',
+  });
 };
