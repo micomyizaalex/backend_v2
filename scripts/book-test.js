@@ -6,7 +6,7 @@
     const scheduleId = process.env.SCHEDULE_ID || process.argv[4];
     const seatNumber = process.env.SEAT_NUMBER || process.argv[5] || '5';
     const price = process.env.PRICE || process.argv[6] || 0;
-    const host = (process.env.HOST || process.argv[7] || 'https://backend-7cxc.onrender.com/api/$1').replace(/\/$/, '');
+    const host = (process.env.HOST || process.argv[7] || 'https://backend-v2-wjcs.onrender.com/api/$1').replace(/\/$/, '');
 
     if (!email || !password || !scheduleId) {
       console.error('Usage: node scripts/book-test.js <email> <password> <scheduleId> [seatNumber] [price] [host]');

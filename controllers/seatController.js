@@ -3,8 +3,40 @@ const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
 const { sendETicketEmail } = require('../services/eTicketService');
 const NotificationService = require('../services/notificationService');
+const QRCode = require('qrcode');
 
-const LOCK_DURATION_MINUTES = parseInt(process.env.SEAT_LOCK_MINUTES || '7', 10);
+const parsedLockMinutes = Number.parseInt(process.env.SEAT_LOCK_MINUTES || '7', 10);
+const LOCK_DURATION_MINUTES = Number.isFinite(parsedLockMinutes)
+  ? Math.min(10, Math.max(5, parsedLockMinutes))
+  : 7;
+const BOOKED_TICKET_STATES = ['CONFIRMED', 'CHECKED_IN'];
+
+const buildBookingRef = () => `BK-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+
+const generateTicketQrDataUrl = async (ticket) => {
+  try {
+    const payload = {
+      ticket_id: ticket.id,
+      ticketId: ticket.id,
+      booking_ref: ticket.booking_ref,
+      schedule_id: ticket.schedule_id,
+      trip_id: ticket.schedule_id,
+      tripId: ticket.schedule_id,
+      seat_number: ticket.seat_number,
+      passenger_id: ticket.passenger_id,
+      issued_at: new Date().toISOString(),
+    };
+
+    return await QRCode.toDataURL(JSON.stringify(payload), {
+      errorCorrectionLevel: 'M',
+      margin: 1,
+      width: 220,
+    });
+  } catch (error) {
+    console.warn('[seatController] QR generation failed:', error.message);
+    return null;
+  }
+};
 
 const getSeatsForSchedule = async (req, res) => {
   const { scheduleId } = req.params;
@@ -51,7 +83,7 @@ const getSeatsForSchedule = async (req, res) => {
         // Rule 2: Check for confirmed/checked-in tickets (BOOKED)
         const confirmed = tickets.find((t) => {
           const ticketSeatNum = String(t.seat_number).trim();
-          return ticketSeatNum === seatNum && (t.status === 'CONFIRMED' || t.status === 'CHECKED_IN');
+          return ticketSeatNum === seatNum && BOOKED_TICKET_STATES.includes(t.status);
         });
         
         if (confirmed) {
@@ -163,7 +195,7 @@ const getBookedSeats = async (req, res) => {
       where: {
         schedule_id: scheduleId,
         status: {
-          [Op.in]: ['CONFIRMED', 'CHECKED_IN']
+          [Op.in]: BOOKED_TICKET_STATES
         }
       },
       attributes: ['seat_number', 'status', 'booking_ref'],
@@ -270,7 +302,15 @@ const lockSeat = async (req, res) => {
     }
 
     // double-check confirmed or checked-in ticket exists
-    const existingConfirmed = await Ticket.findOne({ where: { schedule_id: scheduleId, seat_number, status: ['CONFIRMED', 'CHECKED_IN'] }, transaction: t, lock: t.LOCK.UPDATE });
+    const existingConfirmed = await Ticket.findOne({
+      where: {
+        schedule_id: scheduleId,
+        seat_number,
+        status: { [Op.in]: BOOKED_TICKET_STATES }
+      },
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
     if (existingConfirmed) {
       await t.rollback();
       return res.status(409).json({ message: 'Seat already booked' });
@@ -281,6 +321,15 @@ const lockSeat = async (req, res) => {
     // check active locks
     const activeLock = await SeatLock.findOne({ where: { schedule_id: scheduleId, seat_number, status: 'ACTIVE', expires_at: { [Op.gt]: now } }, transaction: t, lock: t.LOCK.UPDATE });
     if (activeLock) {
+      if (String(activeLock.passenger_id) === String(passenger_id)) {
+        await t.commit();
+        return res.status(200).json({
+          lock_id: activeLock.id,
+          ticket_id: activeLock.ticket_id,
+          expires_at: activeLock.expires_at,
+          message: 'Existing active lock returned'
+        });
+      }
       await t.rollback();
       return res.status(409).json({ message: 'Seat is temporarily locked' });
     }
@@ -292,7 +341,7 @@ const lockSeat = async (req, res) => {
       company_id: schedule.company_id,
       seat_number,
       price: price || 0,
-      booking_ref: `BK-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+      booking_ref: buildBookingRef(),
       status: 'PENDING_PAYMENT',
     }, { transaction: t });
 
@@ -325,16 +374,60 @@ const confirmLock = async (req, res) => {
   const { lockId } = req.params;
   const t = await sequelize.transaction();
   try {
+    const now = new Date();
     const lock = await SeatLock.findByPk(lockId, { transaction: t, lock: t.LOCK.UPDATE });
     if (!lock) { await t.rollback(); return res.status(404).json({ message: 'Lock not found' }); }
     if (lock.status !== 'ACTIVE') { await t.rollback(); return res.status(400).json({ message: 'Lock not active' }); }
+
+    if (new Date(lock.expires_at) <= now) {
+      lock.status = 'EXPIRED';
+      await lock.save({ transaction: t });
+
+      const staleTicket = await Ticket.findByPk(lock.ticket_id, { transaction: t, lock: t.LOCK.UPDATE });
+      if (staleTicket && staleTicket.status === 'PENDING_PAYMENT') {
+        staleTicket.status = 'EXPIRED';
+        await staleTicket.save({ transaction: t });
+      }
+
+      await t.commit();
+      return res.status(409).json({ message: 'Lock expired. Please select the seat again.' });
+    }
 
     // mark ticket confirmed
     const ticket = await Ticket.findByPk(lock.ticket_id, { transaction: t, lock: t.LOCK.UPDATE });
     if (!ticket) { await t.rollback(); return res.status(404).json({ message: 'Ticket not found' }); }
 
+    const existingConfirmed = await Ticket.findOne({
+      where: {
+        schedule_id: lock.schedule_id,
+        seat_number: lock.seat_number,
+        status: { [Op.in]: BOOKED_TICKET_STATES },
+        id: { [Op.ne]: ticket.id },
+      },
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
+    if (existingConfirmed) {
+      lock.status = 'RELEASED';
+      await lock.save({ transaction: t });
+      if (ticket.status === 'PENDING_PAYMENT') {
+        ticket.status = 'EXPIRED';
+        await ticket.save({ transaction: t });
+      }
+      await t.commit();
+      return res.status(409).json({ message: 'Seat already booked by another passenger' });
+    }
+
     // update ticket status
     ticket.status = 'CONFIRMED';
+    ticket.booked_at = now;
+    if (!ticket.booking_ref) {
+      ticket.booking_ref = buildBookingRef();
+    }
+    if (!ticket.qr_code_url) {
+      const qrDataUrl = await generateTicketQrDataUrl(ticket);
+      if (qrDataUrl) ticket.qr_code_url = qrDataUrl;
+    }
     await ticket.save({ transaction: t });
 
     // decrement available seats on schedule and increment booked seats
@@ -429,6 +522,7 @@ const confirmLock = async (req, res) => {
 
 const releaseLock = async (req, res) => {
   const { lockId } = req.params;
+  const reason = (req.body && req.body.reason ? String(req.body.reason) : 'manual_release').slice(0, 120);
   const t = await sequelize.transaction();
   try {
     const lock = await SeatLock.findByPk(lockId, { transaction: t, lock: t.LOCK.UPDATE });
@@ -443,6 +537,11 @@ const releaseLock = async (req, res) => {
     }
 
     lock.status = 'RELEASED';
+    lock.meta = {
+      ...(lock.meta || {}),
+      release_reason: reason,
+      released_at: new Date().toISOString(),
+    };
     await lock.save({ transaction: t });
 
     await t.commit();
@@ -452,6 +551,14 @@ const releaseLock = async (req, res) => {
     console.error(error);
     res.status(500).json({ message: 'Failed to release lock' });
   }
+};
+
+const releaseLockAfterPaymentFailure = async (req, res) => {
+  req.body = {
+    ...(req.body || {}),
+    reason: 'payment_failed',
+  };
+  return releaseLock(req, res);
 };
 
 // Direct booking: create CONFIRMED ticket and consume any user's active lock atomically
@@ -476,7 +583,15 @@ const bookSeat = async (req, res) => {
     if (schedule.departure_time && new Date(schedule.departure_time) <= now) { await t.rollback(); return res.status(400).json({ message: 'Ticket sales closed for this schedule' }); }
 
     // check already confirmed or checked-in ticket
-    const existingConfirmed = await Ticket.findOne({ where: { schedule_id: scheduleId, seat_number, status: ['CONFIRMED', 'CHECKED_IN'] }, transaction: t, lock: t.LOCK.UPDATE });
+    const existingConfirmed = await Ticket.findOne({
+      where: {
+        schedule_id: scheduleId,
+        seat_number,
+        status: { [Op.in]: BOOKED_TICKET_STATES }
+      },
+      transaction: t,
+      lock: t.LOCK.UPDATE
+    });
     if (existingConfirmed) { await t.rollback(); return res.status(409).json({ message: 'Seat already booked' }); }
 
     // check active lock
@@ -490,10 +605,17 @@ const bookSeat = async (req, res) => {
       company_id: schedule.company_id,
       seat_number,
       price: price || 0,
-      booking_ref: `BK-${Date.now()}-${Math.random().toString(36).slice(2,8)}`,
+      booking_ref: buildBookingRef(),
       status: 'CONFIRMED',
       booked_at: new Date(),
     }, { transaction: t });
+
+    if (!ticket.qr_code_url) {
+      const qrDataUrl = await generateTicketQrDataUrl(ticket);
+      if (qrDataUrl) {
+        ticket.qr_code_url = qrDataUrl;
+      }
+    }
 
     // if there was an active lock belonging to this user, consume it and link to ticket
     if (activeLock && activeLock.passenger_id === passenger_id) {
@@ -721,7 +843,7 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
       where: {
         schedule_id: scheduleId,
         seat_number: normalizedSeatNumbers,
-        status: ['CONFIRMED', 'CHECKED_IN']
+        status: { [Op.in]: BOOKED_TICKET_STATES }
       },
       transaction,
       lock: transaction.LOCK.UPDATE
@@ -735,6 +857,17 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
         error: 'Seat not available',
         message: `The following seats are already occupied: ${occupiedSeats}`,
         occupiedSeats: existingTickets.map(t => t.seat_number)
+      });
+    }
+
+    const invalidDriverSeats = seatRecords
+      .filter((seat) => Boolean(seat.is_driver))
+      .map((seat) => String(seat.seat_number));
+    if (invalidDriverSeats.length > 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        error: `Cannot book driver seats: ${invalidDriverSeats.join(', ')}`
       });
     }
 
@@ -766,7 +899,6 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
 
     // STEP 8: Create CONFIRMED tickets for all requested seats
     const tickets = [];
-    const lockExpiresAt = new Date(now.getTime() + LOCK_DURATION_MINUTES * 60000);
 
     for (const seatNumber of normalizedSeatNumbers) {
       // Generate unique booking reference
@@ -784,21 +916,11 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
         booked_at: now
       }, { transaction });
 
-      // STEP 9: Create seat lock to prevent concurrent access
-      // (This provides double protection alongside the CONFIRMED status)
-      const lock = await SeatLock.create({
-        schedule_id: scheduleId,
-        company_id: schedule.company_id,
-        seat_number: seatNumber,
-        passenger_id: userId,
-        ticket_id: ticket.id,
-        expires_at: lockExpiresAt,
-        status: 'CONFIRMED' // Lock is confirmed (not just ACTIVE)
-      }, { transaction });
-
-      // Link ticket to lock
-      ticket.lock_id = lock.id;
-      await ticket.save({ transaction });
+      const qrDataUrl = await generateTicketQrDataUrl(ticket);
+      if (qrDataUrl) {
+        ticket.qr_code_url = qrDataUrl;
+        await ticket.save({ transaction });
+      }
 
       tickets.push(ticket);
 
@@ -840,7 +962,7 @@ const bookSeatsWithConcurrencySafety = async (req, res) => {
       );
 
       let state = 'AVAILABLE';
-      if (hasTicket) state = 'OCCUPIED'; // or 'BOOKED'
+      if (hasTicket) state = 'BOOKED';
       else if (hasLock) state = 'LOCKED';
 
       return {
@@ -983,6 +1105,7 @@ module.exports = {
   lockSeat, 
   confirmLock, 
   releaseLock, 
+  releaseLockAfterPaymentFailure,
   bookSeat,
   bookSeatsWithConcurrencySafety 
 };

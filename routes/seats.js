@@ -19,6 +19,9 @@ router.post('/locks/:lockId/confirm', auth, seatController.confirmLock);
 // Release lock (e.g., timeout or user cancel)
 router.post('/locks/:lockId/release', auth, seatController.releaseLock);
 
+// Release lock immediately when payment fails/cancels
+router.post('/locks/:lockId/payment-failed', auth, seatController.releaseLockAfterPaymentFailure);
+
 // Directly book a seat (create CONFIRMED ticket + consume any lock) - requires auth
 router.post('/schedules/:scheduleId/book', auth, seatController.bookSeat);
 

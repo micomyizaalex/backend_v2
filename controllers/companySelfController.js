@@ -1,6 +1,7 @@
 const { Company, Bus, Schedule, Ticket, User, Driver, Route, DriverAssignment, Payment, sequelize } = require('../models');
 const crypto = require('crypto');
 const { Op } = require('sequelize');
+const { QueryTypes } = require('sequelize');
 const busService = require('../services/busService');
 const NotificationService = require('../services/notificationService');
 const { DEFAULT_PLAN, getPlanPermissions, normalizePlan, hasPlanFeature, isPlanUpgrade } = require('../utils/subscriptionPlans');
@@ -573,71 +574,134 @@ const getTickets = async (req, res) => {
 
     console.log('Fetching tickets for company:', companyId);
 
-    const tickets = await Ticket.findAll({ 
-      where: { company_id: companyId },
-      include: [
-        {
-          model: User,
-          as: 'passenger',
-          attributes: ['id', 'full_name', 'email', 'phone_number'],
-          required: false
-        },
-        {
-          model: Schedule,
-          attributes: ['id', 'schedule_date', 'departure_time', 'price_per_seat'],
-          required: false,
-          include: [
-            {
-              model: Route,
-              attributes: ['id', 'origin', 'destination'],
-              required: false
-            },
-            {
-              model: Bus,
-              attributes: ['id', 'plate_number', 'model'],
-              required: false
-            }
-          ]
-        }
-      ],
-      order: [['booked_at', 'DESC']]
-    });
+    const ticketsTable = await sequelize.getQueryInterface().describeTable('tickets');
+    const hasTripDateColumn = Boolean(ticketsTable?.trip_date);
+    const hasFromStopColumn = Boolean(ticketsTable?.from_stop);
+    const hasToStopColumn = Boolean(ticketsTable?.to_stop);
+    const hasPassengerNameColumn = Boolean(ticketsTable?.passenger_name);
+    const busSchedulesCheck = await sequelize.query(
+      `
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name = 'bus_schedules'
+        ) AS exists
+      `,
+      { type: QueryTypes.SELECT }
+    );
+    const hasBusSchedulesTable = Boolean(busSchedulesCheck?.[0]?.exists);
 
-    console.log(`Found ${tickets.length} tickets for company ${companyId}`);
+    const sharedScheduleSelect = hasBusSchedulesTable
+      ? `
+          bs.date AS bs_date,
+          bs.time AS bs_time,
+          rr.from_location AS rr_from_location,
+          rr.to_location AS rr_to_location,
+          bb.plate_number AS bs_bus_plate_number,
+          bb.model AS bs_bus_model,
+          bs.company_id AS bs_company_id
+        `
+      : `
+          NULL::date AS bs_date,
+          NULL::time AS bs_time,
+          NULL::text AS rr_from_location,
+          NULL::text AS rr_to_location,
+          NULL::text AS bs_bus_plate_number,
+          NULL::text AS bs_bus_model,
+          NULL::uuid AS bs_company_id
+        `;
 
-    const mapped = tickets.map(t => {
-      const passenger = t.passenger;
-      const schedule = t.Schedule;
-      const route = schedule?.Route;
-      const bus = schedule?.Bus;
+    const sharedScheduleJoin = hasBusSchedulesTable
+      ? `
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+        LEFT JOIN buses bb ON bb.id = bs.bus_id
+      `
+      : '';
 
-      return {
-        id: t.id,
-        bookingRef: t.booking_ref,
-        price: parseFloat(t.price || 0),
-        paymentStatus: t.status === 'CONFIRMED' || t.status === 'CHECKED_IN' ? 'paid' : 'unpaid',
-        seatNumber: t.seat_number,
-        qrCode: t.qr_code_url || null,
-        status: t.status,
-        scanned: !!t.checked_in_at,
-        bookedAt: t.booked_at,
-        checkedInAt: t.checked_in_at,
-        scheduleId: t.schedule_id,
-        // Passenger info
-        passengerName: passenger ? passenger.full_name : 'N/A',
-        passengerEmail: passenger?.email || 'N/A',
-        passengerPhone: passenger?.phone_number || 'N/A',
-        // Schedule info
-        scheduleDate: schedule?.schedule_date || null,
-        departureTime: schedule?.departure_time || null,
-        // Route info
-        routeFrom: route?.origin || 'N/A',
-        routeTo: route?.destination || 'N/A',
-        // Bus info
-        busPlateNumber: bus?.plate_number || 'N/A',
-        busModel: bus?.model || 'N/A'
-      };
-    });
+    const companyOwnershipFilter = hasBusSchedulesTable
+      ? `(t.company_id = :companyId OR s.company_id = :companyId OR bs.company_id::text = CAST(:companyId AS text))`
+      : `(t.company_id = :companyId OR s.company_id = :companyId)`;
+
+    const passengerNameExpr = hasPassengerNameColumn ? 't.passenger_name' : 'NULL::text';
+
+    const ticketRows = await sequelize.query(
+      `
+        SELECT
+          t.id,
+          t.booking_ref,
+          t.price,
+          t.status,
+          t.seat_number,
+          t.qr_code_url,
+          t.booked_at,
+          t.checked_in_at,
+          t.schedule_id,
+          ${hasTripDateColumn ? 't.trip_date' : 'NULL::date AS trip_date'},
+          ${hasFromStopColumn ? 't.from_stop' : 'NULL::text AS from_stop'},
+          ${hasToStopColumn ? 't.to_stop' : 'NULL::text AS to_stop'},
+          COALESCE(NULLIF(TRIM(u.full_name), ''), u.email, u.phone_number, ${passengerNameExpr}, 'N/A') AS passenger_name,
+          u.email AS passenger_email,
+          u.phone_number AS passenger_phone,
+          s.schedule_date,
+          s.departure_time,
+          r.origin AS route_from,
+          r.destination AS route_to,
+          b.plate_number AS bus_plate_number,
+          b.model AS bus_model,
+          ${sharedScheduleSelect}
+        FROM tickets t
+        LEFT JOIN users u ON u.id = t.passenger_id
+        LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+        LEFT JOIN routes r ON r.id = s.route_id
+        LEFT JOIN buses b ON b.id = s.bus_id
+        ${sharedScheduleJoin}
+        WHERE ${companyOwnershipFilter}
+        ORDER BY t.booked_at DESC
+      `,
+      {
+        replacements: { companyId },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    console.log(`Found ${ticketRows.length} tickets for company ${companyId}`);
+
+    const mapped = ticketRows.map((t) => ({
+      id: t.id,
+      bookingRef: t.booking_ref,
+      booking_ref: t.booking_ref,
+      price: parseFloat(t.price || 0),
+      paymentStatus: t.status === 'CONFIRMED' || t.status === 'CHECKED_IN' ? 'paid' : 'unpaid',
+      seatNumber: t.seat_number,
+      seat_number: t.seat_number,
+      qrCode: t.qr_code_url || null,
+      status: t.status,
+      scanned: !!t.checked_in_at,
+      bookedAt: t.booked_at,
+      checkedInAt: t.checked_in_at,
+      scheduleId: t.schedule_id,
+      schedule_id: t.schedule_id,
+      // Passenger info
+      passengerName: t.passenger_name || 'N/A',
+      passenger_name: t.passenger_name || 'N/A',
+      passengerEmail: t.passenger_email || 'N/A',
+      passengerPhone: t.passenger_phone || 'N/A',
+      // Schedule info
+      scheduleDate: t.schedule_date || t.bs_date || t.trip_date || null,
+      departureTime: t.departure_time || t.bs_time || null,
+      created_at: t.booked_at,
+      createdAt: t.booked_at,
+      // Route info
+      routeFrom: t.route_from || t.rr_from_location || t.from_stop || 'N/A',
+      from_stop: t.from_stop || t.route_from || t.rr_from_location || null,
+      routeTo: t.route_to || t.rr_to_location || t.to_stop || 'N/A',
+      to_stop: t.to_stop || t.route_to || t.rr_to_location || null,
+      // Bus info
+      busPlateNumber: t.bus_plate_number || t.bs_bus_plate_number || 'N/A',
+      busModel: t.bus_model || t.bs_bus_model || 'N/A'
+    }));
 
     console.log(`Returning ${mapped.length} mapped tickets`);
     res.json({ tickets: mapped });
@@ -1722,137 +1786,349 @@ const getRevenue = async (req, res) => {
       });
     }
 
-    // Build date filters
-    let dateFilter = {};
-    if (startDate && endDate) {
-      dateFilter = {
-        schedule_date: {
-          [Op.between]: [startDate, endDate]
-        }
-      };
-    }
+    const ticketsTable = await sequelize.getQueryInterface().describeTable('tickets');
+    const hasTripDateColumn = Boolean(ticketsTable?.trip_date);
+    const hasFromStopColumn = Boolean(ticketsTable?.from_stop);
+    const hasToStopColumn = Boolean(ticketsTable?.to_stop);
 
-    // Fetch all schedules for the company
-    const schedules = await Schedule.findAll({
-      where: {
-        company_id: companyId,
-        ...dateFilter
-      },
-      include: [
-        {
-          model: Route,
-          attributes: ['id', 'origin', 'destination']
-        },
-        {
-          model: Bus,
-          attributes: ['id', 'plate_number']
-        }
-      ],
-      order: [['schedule_date', 'DESC']]
-    });
+    const busSchedulesCheck = await sequelize.query(
+      `
+        SELECT EXISTS (
+          SELECT 1
+          FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name = 'bus_schedules'
+        ) AS exists
+      `,
+      { type: QueryTypes.SELECT }
+    );
+    const hasBusSchedulesTable = Boolean(busSchedulesCheck?.[0]?.exists);
+    const busSchedulesTable = hasBusSchedulesTable
+      ? await sequelize.getQueryInterface().describeTable('bus_schedules')
+      : null;
+    const hasBusSchedulesDriverId = Boolean(busSchedulesTable?.driver_id);
 
-    // Calculate revenue from schedules (sold seats × price)
-    let totalRevenue = 0;
-    let totalTickets = 0;
-    const dailyRevenueMap = new Map();
-    const routeBreakdownMap = new Map();
+    const tripDateExpr = hasTripDateColumn ? 't.trip_date' : 'NULL::date';
+    const fromStopExpr = hasFromStopColumn ? 't.from_stop' : 'NULL::text';
+    const toStopExpr = hasToStopColumn ? 't.to_stop' : 'NULL::text';
+    const sharedDriverNameExpr = hasBusSchedulesTable
+      ? (hasBusSchedulesDriverId ? 'COALESCE(sbd.name, bbd.name)' : 'bbd.name')
+      : 'NULL::text';
+    const driverCoalesceExpr = hasBusSchedulesTable
+      ? (hasBusSchedulesDriverId
+        ? 'COALESCE(sd.name, bd.name, sbd.name, bbd.name, \'Unassigned\')'
+        : 'COALESCE(sd.name, bd.name, bbd.name, \'Unassigned\')')
+      : 'COALESCE(sd.name, bd.name, \'Unassigned\')';
+
+    const sharedScheduleSelect = hasBusSchedulesTable
+      ? `
+          bs.date AS bs_date,
+          bs.time AS bs_time,
+          bs.capacity AS bs_capacity,
+          bs.status AS bs_status,
+          rr.from_location AS rr_from_location,
+          rr.to_location AS rr_to_location,
+          bb.plate_number AS bs_bus_plate,
+          ${sharedDriverNameExpr} AS bs_driver_name,
+          bs.company_id AS bs_company_id
+        `
+      : `
+          NULL::date AS bs_date,
+          NULL::time AS bs_time,
+          NULL::integer AS bs_capacity,
+          NULL::text AS bs_status,
+          NULL::text AS rr_from_location,
+          NULL::text AS rr_to_location,
+          NULL::text AS bs_bus_plate,
+          NULL::text AS bs_driver_name,
+          NULL::uuid AS bs_company_id
+        `;
+
+    const sharedScheduleJoin = hasBusSchedulesTable
+      ? `
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+        LEFT JOIN buses bb ON bb.id = bs.bus_id
+        ${hasBusSchedulesDriverId ? 'LEFT JOIN drivers sbd ON sbd.id = bs.driver_id' : ''}
+        LEFT JOIN drivers bbd ON bbd.id = bb.driver_id
+      `
+      : '';
+
+    const ownershipFilter = hasBusSchedulesTable
+      ? `(t.company_id = :companyId OR s.company_id = :companyId OR bs.company_id::text = CAST(:companyId AS text))`
+      : `(t.company_id = :companyId OR s.company_id = :companyId)`;
+
+    const ticketRows = await sequelize.query(
+      `
+        SELECT
+          t.id,
+          t.status,
+          t.price,
+          t.schedule_id,
+          t.booked_at,
+          ${tripDateExpr} AS trip_date,
+          ${fromStopExpr} AS from_stop,
+          ${toStopExpr} AS to_stop,
+          COALESCE(s.schedule_date, ${hasBusSchedulesTable ? 'bs.date' : 'NULL::date'}, ${tripDateExpr}, DATE(t.booked_at))::date AS effective_date,
+          COALESCE(s.departure_time::text, ${hasBusSchedulesTable ? 'bs.time::text' : 'NULL::text'}) AS departure_time,
+          COALESCE(r.origin, ${hasBusSchedulesTable ? 'rr.from_location' : 'NULL::text'}, ${fromStopExpr}, 'N/A') AS route_from,
+          COALESCE(r.destination, ${hasBusSchedulesTable ? 'rr.to_location' : 'NULL::text'}, ${toStopExpr}, 'N/A') AS route_to,
+          COALESCE(b.plate_number, ${hasBusSchedulesTable ? 'bb.plate_number' : 'NULL::text'}, 'N/A') AS bus_plate,
+          ${driverCoalesceExpr} AS driver_name,
+          COALESCE(s.total_seats, ${hasBusSchedulesTable ? 'bs.capacity' : 'NULL::integer'}, 0) AS capacity,
+          COALESCE(s.status::text, ${hasBusSchedulesTable ? 'bs.status::text' : 'NULL::text'}, 'scheduled') AS schedule_status,
+          ${sharedScheduleSelect}
+        FROM tickets t
+        LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+        LEFT JOIN routes r ON r.id = s.route_id
+        LEFT JOIN buses b ON b.id = s.bus_id
+        LEFT JOIN drivers sd ON sd.id = s.driver_id
+        LEFT JOIN drivers bd ON bd.id = b.driver_id
+        ${sharedScheduleJoin}
+        WHERE ${ownershipFilter}
+          ${startDate ? `AND COALESCE(s.schedule_date, ${hasBusSchedulesTable ? 'bs.date' : 'NULL::date'}, ${tripDateExpr}, DATE(t.booked_at))::date >= :startDate` : ''}
+          ${endDate ? `AND COALESCE(s.schedule_date, ${hasBusSchedulesTable ? 'bs.date' : 'NULL::date'}, ${tripDateExpr}, DATE(t.booked_at))::date <= :endDate` : ''}
+        ORDER BY COALESCE(s.schedule_date, ${hasBusSchedulesTable ? 'bs.date' : 'NULL::date'}, ${tripDateExpr}, DATE(t.booked_at)) DESC, t.booked_at DESC
+      `,
+      {
+        replacements: { companyId, startDate: startDate || null, endDate: endDate || null },
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    const isCountableTicket = (statusValue) => {
+      const status = String(statusValue || '').toUpperCase();
+      return status !== 'CANCELLED' && status !== 'EXPIRED';
+    };
+
+    const toDateString = (value) => {
+      if (!value) return null;
+      const text = String(value);
+      return text.length >= 10 ? text.slice(0, 10) : null;
+    };
+
+    const activeTickets = ticketRows.filter((row) => isCountableTicket(row.status));
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    const todayStr = today.toISOString().split('T')[0];
+    const todayStr = today.toISOString().slice(0, 10);
 
     const weekAgo = new Date(today);
-    weekAgo.setDate(weekAgo.getDate() - 7);
-    const weekAgoStr = weekAgo.toISOString().split('T')[0];
+    weekAgo.setDate(weekAgo.getDate() - 6);
+    const weekAgoStr = weekAgo.toISOString().slice(0, 10);
 
     const monthAgo = new Date(today);
-    monthAgo.setMonth(monthAgo.getMonth() - 1);
-    const monthAgoStr = monthAgo.toISOString().split('T')[0];
+    monthAgo.setDate(monthAgo.getDate() - 29);
+    const monthAgoStr = monthAgo.toISOString().slice(0, 10);
 
-    let todayRevenue = 0;
-    let todayTickets = 0;
-    let weekRevenue = 0;
-    let weekTickets = 0;
-    let monthRevenue = 0;
-    let monthTickets = 0;
+    const totalRevenue = activeTickets.reduce((sum, row) => sum + Number(row.price || 0), 0);
+    const totalTickets = activeTickets.length;
 
-    schedules.forEach(s => {
-      const totalSeats = s.total_seats || 0;
-      const availableSeats = s.available_seats != null ? s.available_seats : totalSeats;
-      const soldSeats = totalSeats - availableSeats;
-      const price = parseFloat(s.price_per_seat || 0);
-      const scheduleRevenue = soldSeats * price;
-
-      totalRevenue += scheduleRevenue;
-      totalTickets += soldSeats;
-
-      const scheduleDate = s.schedule_date;
-      if (scheduleDate) {
-        // Daily revenue aggregation
-        if (!dailyRevenueMap.has(scheduleDate)) {
-          dailyRevenueMap.set(scheduleDate, { date: scheduleDate, revenue: 0, tickets: 0 });
-        }
-        const dayData = dailyRevenueMap.get(scheduleDate);
-        dayData.revenue += scheduleRevenue;
-        dayData.tickets += soldSeats;
-
-        // Today's revenue
-        if (scheduleDate === todayStr) {
-          todayRevenue += scheduleRevenue;
-          todayTickets += soldSeats;
-        }
-
-        // Week revenue
-        if (scheduleDate >= weekAgoStr) {
-          weekRevenue += scheduleRevenue;
-          weekTickets += soldSeats;
-        }
-
-        // Month revenue
-        if (scheduleDate >= monthAgoStr) {
-          monthRevenue += scheduleRevenue;
-          monthTickets += soldSeats;
-        }
-      }
-
-      // Route breakdown
-      const route = s.Route;
-      const routeName = route ? `${route.origin} → ${route.destination}` : 'Unknown Route';
-      const key = `${routeName}_${scheduleDate}_${s.departure_time}`;
-      
-      if (!routeBreakdownMap.has(key)) {
-        routeBreakdownMap.set(key, {
-          route: routeName,
-          scheduleDate: scheduleDate || '—',
-          departureTime: s.departure_time || '—',
-          ticketsSold: 0,
-          revenue: 0
-        });
-      }
-      const routeData = routeBreakdownMap.get(key);
-      routeData.ticketsSold += soldSeats;
-      routeData.revenue += scheduleRevenue;
+    const todayTicketsList = activeTickets.filter((row) => toDateString(row.effective_date) === todayStr);
+    const weekTicketsList = activeTickets.filter((row) => {
+      const date = toDateString(row.effective_date);
+      return date && date >= weekAgoStr;
+    });
+    const monthTicketsList = activeTickets.filter((row) => {
+      const date = toDateString(row.effective_date);
+      return date && date >= monthAgoStr;
     });
 
-    // Convert maps to arrays
-    const dailyRevenue = Array.from(dailyRevenueMap.values())
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .slice(-30); // Last 30 days
+    const todayRevenue = todayTicketsList.reduce((sum, row) => sum + Number(row.price || 0), 0);
+    const weekRevenue = weekTicketsList.reduce((sum, row) => sum + Number(row.price || 0), 0);
+    const monthRevenue = monthTicketsList.reduce((sum, row) => sum + Number(row.price || 0), 0);
+
+    const dailyMap = new Map();
+    const routeBreakdownMap = new Map();
+    const topRoutesMap = new Map();
+    const busPerformanceMap = new Map();
+    const driverPerformanceMap = new Map();
+    const peakHourMap = new Map();
+    const peakDayMap = new Map();
+    const occupancyMap = new Map();
+
+    activeTickets.forEach((row) => {
+      const date = toDateString(row.effective_date) || todayStr;
+      const route = `${row.route_from || 'N/A'} → ${row.route_to || 'N/A'}`;
+      const departureTime = row.departure_time ? String(row.departure_time).slice(0, 5) : '—';
+      const revenue = Number(row.price || 0);
+      const scheduleId = String(row.schedule_id || 'unknown');
+      const busPlate = row.bus_plate || 'N/A';
+      const driverName = row.driver_name || 'Unassigned';
+      const capacity = Number(row.capacity || 0);
+
+      if (!dailyMap.has(date)) dailyMap.set(date, { date, revenue: 0, tickets: 0 });
+      const daily = dailyMap.get(date);
+      daily.revenue += revenue;
+      daily.tickets += 1;
+
+      const breakdownKey = `${route}_${date}_${departureTime}`;
+      if (!routeBreakdownMap.has(breakdownKey)) {
+        routeBreakdownMap.set(breakdownKey, {
+          route,
+          scheduleDate: date,
+          departureTime,
+          ticketsSold: 0,
+          revenue: 0,
+        });
+      }
+      const breakdown = routeBreakdownMap.get(breakdownKey);
+      breakdown.ticketsSold += 1;
+      breakdown.revenue += revenue;
+
+      if (!topRoutesMap.has(route)) {
+        topRoutesMap.set(route, { route, ticketsSold: 0, revenue: 0 });
+      }
+      const topRoute = topRoutesMap.get(route);
+      topRoute.ticketsSold += 1;
+      topRoute.revenue += revenue;
+
+      if (!busPerformanceMap.has(busPlate)) {
+        busPerformanceMap.set(busPlate, {
+          busPlate,
+          totalTripsSet: new Set(),
+          passengersCarried: 0,
+          revenueGenerated: 0,
+        });
+      }
+      const busPerf = busPerformanceMap.get(busPlate);
+      busPerf.totalTripsSet.add(scheduleId);
+      busPerf.passengersCarried += 1;
+      busPerf.revenueGenerated += revenue;
+
+      if (!driverPerformanceMap.has(driverName)) {
+        driverPerformanceMap.set(driverName, {
+          driverName,
+          completedTripsSet: new Set(),
+          passengersHandled: 0,
+        });
+      }
+      const driverPerf = driverPerformanceMap.get(driverName);
+      if (String(row.schedule_status || '').toLowerCase() === 'completed') {
+        driverPerf.completedTripsSet.add(scheduleId);
+      }
+      driverPerf.passengersHandled += 1;
+
+      const hour = departureTime !== '—' ? departureTime.slice(0, 2) : String(new Date(row.booked_at).getHours()).padStart(2, '0');
+      peakHourMap.set(hour, (peakHourMap.get(hour) || 0) + 1);
+
+      const dayName = new Date(`${date}T00:00:00`).toLocaleDateString('en-US', { weekday: 'short' });
+      peakDayMap.set(dayName, (peakDayMap.get(dayName) || 0) + 1);
+
+      if (!occupancyMap.has(scheduleId)) {
+        occupancyMap.set(scheduleId, { capacity: Math.max(capacity, 0), sold: 0 });
+      }
+      const occupancy = occupancyMap.get(scheduleId);
+      occupancy.sold += 1;
+      if (capacity > occupancy.capacity) occupancy.capacity = capacity;
+    });
+
+    const totalCapacity = Array.from(occupancyMap.values()).reduce((sum, entry) => sum + Number(entry.capacity || 0), 0);
+    const totalSoldForOccupancy = Array.from(occupancyMap.values()).reduce((sum, entry) => sum + Number(entry.sold || 0), 0);
+    const occupancyRate = totalCapacity > 0 ? (totalSoldForOccupancy / totalCapacity) * 100 : 0;
+
+    const averageTicketPrice = totalTickets > 0 ? totalRevenue / totalTickets : 0;
+
+    const previousPeriodMetrics = (() => {
+      const dateBuckets = activeTickets.map((row) => toDateString(row.effective_date)).filter(Boolean);
+      if (!dateBuckets.length) return { revenuePct: null, ticketsPct: null };
+
+      const toDate = (value) => new Date(`${value}T00:00:00`);
+      const selectedStart = startDate ? toDate(startDate) : new Date(`${weekAgoStr}T00:00:00`);
+      const selectedEnd = endDate ? toDate(endDate) : new Date(`${todayStr}T00:00:00`);
+      const periodDays = Math.max(1, Math.floor((selectedEnd.getTime() - selectedStart.getTime()) / (24 * 3600 * 1000)) + 1);
+      const prevEnd = new Date(selectedStart);
+      prevEnd.setDate(prevEnd.getDate() - 1);
+      const prevStart = new Date(prevEnd);
+      prevStart.setDate(prevStart.getDate() - (periodDays - 1));
+
+      const currentStartStr = selectedStart.toISOString().slice(0, 10);
+      const currentEndStr = selectedEnd.toISOString().slice(0, 10);
+      const prevStartStr = prevStart.toISOString().slice(0, 10);
+      const prevEndStr = prevEnd.toISOString().slice(0, 10);
+
+      const inRange = (date, start, end) => date && date >= start && date <= end;
+
+      const currentRows = activeTickets.filter((row) => inRange(toDateString(row.effective_date), currentStartStr, currentEndStr));
+      const previousRows = activeTickets.filter((row) => inRange(toDateString(row.effective_date), prevStartStr, prevEndStr));
+
+      const currentRevenue = currentRows.reduce((sum, row) => sum + Number(row.price || 0), 0);
+      const previousRevenue = previousRows.reduce((sum, row) => sum + Number(row.price || 0), 0);
+      const currentTickets = currentRows.length;
+      const previousTickets = previousRows.length;
+
+      const pct = (current, previous) => {
+        if (!previous) return null;
+        return ((current - previous) / previous) * 100;
+      };
+
+      return {
+        revenuePct: pct(currentRevenue, previousRevenue),
+        ticketsPct: pct(currentTickets, previousTickets),
+      };
+    })();
+
+    const dailyRevenue = Array.from(dailyMap.values())
+      .sort((a, b) => a.date.localeCompare(b.date));
 
     const breakdownByRoute = Array.from(routeBreakdownMap.values())
       .sort((a, b) => b.revenue - a.revenue);
+
+    const topRoutes = Array.from(topRoutesMap.values())
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 5);
+
+    const busPerformance = Array.from(busPerformanceMap.values())
+      .map((item) => ({
+        busPlate: item.busPlate,
+        totalTrips: item.totalTripsSet.size,
+        passengersCarried: item.passengersCarried,
+        revenueGenerated: Math.round(item.revenueGenerated),
+      }))
+      .sort((a, b) => b.revenueGenerated - a.revenueGenerated);
+
+    const driverPerformance = Array.from(driverPerformanceMap.values())
+      .map((item) => ({
+        driverName: item.driverName,
+        tripsCompleted: item.completedTripsSet.size,
+        passengersHandled: item.passengersHandled,
+      }))
+      .sort((a, b) => b.passengersHandled - a.passengersHandled);
+
+    const peakTimes = {
+      hours: Array.from(peakHourMap.entries())
+        .map(([hour, tickets]) => ({ hour: `${hour}:00`, tickets }))
+        .sort((a, b) => b.tickets - a.tickets),
+      days: Array.from(peakDayMap.entries())
+        .map(([day, tickets]) => ({ day, tickets }))
+        .sort((a, b) => b.tickets - a.tickets),
+    };
 
     res.json({
       totalRevenue: Math.round(totalRevenue),
       totalTickets,
       todayRevenue: Math.round(todayRevenue),
-      todayTickets,
+      todayTickets: todayTicketsList.length,
       weekRevenue: Math.round(weekRevenue),
-      weekTickets,
+      weekTickets: weekTicketsList.length,
       monthRevenue: Math.round(monthRevenue),
-      monthTickets,
+      monthTickets: monthTicketsList.length,
+      averageTicketPrice: Math.round(averageTicketPrice),
+      occupancyRate: Number(occupancyRate.toFixed(2)),
+      previousPeriodChange: {
+        revenuePct: previousPeriodMetrics.revenuePct,
+        ticketsPct: previousPeriodMetrics.ticketsPct,
+      },
       dailyRevenue,
       breakdownByRoute,
+      topRoutes,
+      busPerformance,
+      driverPerformance,
+      peakTimes,
+      selectedRange: {
+        startDate: startDate || null,
+        endDate: endDate || null,
+      },
       subscriptionPlan: plan,
       planPermissions: permissions,
     });

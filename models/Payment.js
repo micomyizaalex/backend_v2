@@ -37,12 +37,79 @@ const Payment = sequelize.define(
 
     status: {
       type: DataTypes.STRING,
-      defaultValue: "PENDING",
+      defaultValue: "pending",
+    },
+
+    booking_status: {
+      type: DataTypes.STRING,
+      defaultValue: "pending_payment",
+      allowNull: false,
     },
 
     transaction_ref: {
       type: DataTypes.STRING,
       unique: true,
+      allowNull: true,
+    },
+
+    provider_name: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+
+    provider_reference: {
+      type: DataTypes.STRING,
+      allowNull: true,
+      unique: true,
+    },
+
+    provider_status: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+
+    currency: {
+      type: DataTypes.STRING,
+      allowNull: false,
+      defaultValue: 'RWF',
+    },
+
+    seat_lock_ids: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: [],
+    },
+
+    held_ticket_ids: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: [],
+    },
+
+    seat_numbers: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: [],
+    },
+
+    meta: {
+      type: DataTypes.JSONB,
+      allowNull: false,
+      defaultValue: {},
+    },
+
+    expires_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    completed_at: {
+      type: DataTypes.DATE,
+      allowNull: true,
+    },
+
+    failed_at: {
+      type: DataTypes.DATE,
       allowNull: true,
     },
   },
@@ -54,7 +121,9 @@ const Payment = sequelize.define(
       { fields: ["user_id"] },
       { fields: ["schedule_id"] },
       { fields: ["status"] },
+      { fields: ["booking_status"] },
       { fields: ["transaction_ref"] },
+      { fields: ["provider_reference"] },
     ],
   }
 );

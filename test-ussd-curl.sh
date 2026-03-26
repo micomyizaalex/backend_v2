@@ -6,7 +6,7 @@
 # Usage: bash test-ussd-curl.sh
 # Windows: Use Git Bash or WSL
 
-BASE_URL="https://backend-7cxc.onrender.com/api/$1/api/ussd"
+BASE_URL="https://backend-v2-wjcs.onrender.com/api/$1/api/ussd"
 
 echo "=========================================="
 echo "SafariTix USSD cURL Test Script"

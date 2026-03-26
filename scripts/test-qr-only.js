@@ -12,7 +12,7 @@ async function testQRCode() {
     o: 'Kigali',
     d: 'Musanze',
     dt: '2026-02-25T10:00:00',
-    v: 'https://backend-7cxc.onrender.com/api/$1/api/tickets/verify/test-ticket-001'
+    v: 'https://backend-v2-wjcs.onrender.com/api/$1/api/tickets/verify/test-ticket-001'
   };
   
   console.log('📦 QR Data:', qrData);

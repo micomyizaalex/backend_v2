@@ -1,6 +1,7 @@
 const { Schedule, Route, Bus, Company, Driver, Location, Ticket } = require('../models');
 const { Op } = require('sequelize');
 const pool = require('../config/pgPool');
+const NotificationService = require('../services/notificationService');
 
 /**
  * PUBLIC CONTROLLER - Schedule Search & Discovery
@@ -525,7 +526,66 @@ const getScheduleById = async (req, res) => {
   try {
     const { id } = req.params;
     const schedule = await Schedule.findByPk(id, { include: [Route, Bus] });
-    if (!schedule) return res.status(404).json({ error: 'Schedule not found' });
+    if (!schedule) {
+      // Shared schedules can live in bus_schedules where the primary identifier is schedule_id.
+      const sharedResult = await pool.query(
+        `
+          SELECT
+            bs.schedule_id,
+            bs.bus_id,
+            bs.route_id,
+            bs.date,
+            bs.time,
+            bs.capacity,
+            COALESCE(bs.booked_seats, 0) AS booked_seats,
+            COALESCE(bs.status, 'scheduled') AS status,
+            rr.from_location,
+            rr.to_location,
+            rr.price,
+            b.plate_number
+          FROM bus_schedules bs
+          LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+          LEFT JOIN buses b ON b.id = bs.bus_id
+          WHERE bs.schedule_id::text = $1::text
+          LIMIT 1
+        `,
+        [id]
+      );
+
+      const shared = sharedResult.rows[0];
+      if (!shared) {
+        return res.status(404).json({ error: 'Schedule not found' });
+      }
+
+      const capacity = parseInt(shared.capacity || 0, 10);
+      const bookedSeats = parseInt(shared.booked_seats || 0, 10);
+      const availableSeats = Math.max(capacity - bookedSeats, 0);
+
+      return res.json({ schedule: {
+        id: shared.schedule_id,
+        routeId: shared.route_id,
+        busId: shared.bus_id,
+        date: shared.date ? String(shared.date).slice(0, 10) : null,
+        schedule_date: shared.date ? String(shared.date).slice(0, 10) : null,
+        departureTime: shared.time ? String(shared.time).slice(0, 8) : null,
+        departure_time: shared.time ? String(shared.time).slice(0, 8) : null,
+        arrivalTime: null,
+        arrival_time: null,
+        price: parseFloat(shared.price || 0),
+        availableSeats,
+        totalPassengerSeats: capacity,
+        bookedSeats,
+        status: shared.status,
+        bookable: ['scheduled', 'in_progress'].includes(String(shared.status || '').toLowerCase()) && availableSeats > 0,
+        routeFrom: shared.from_location || null,
+        routeTo: shared.to_location || null,
+        route_from: shared.from_location || null,
+        route_to: shared.to_location || null,
+        busPlate: shared.plate_number || null,
+        bus_plate: shared.plate_number || null,
+        busCapacity: capacity || null,
+      }});
+    }
     
     // Calculate real passenger seat availability (exclude driver seats)
     const passengerSeatCount = await pool.query(
@@ -1218,7 +1278,7 @@ const scanTicket = async (req, res) => {
 // Cancel a ticket (user canceling their own ticket)
 const cancelTicket = async (req, res) => {
   const { ticketId } = req.params;
-  const userId = req.user?.id;
+  const userId = req.user?.id || req.userId;
 
   if (!userId) {
     return res.status(401).json({ 
@@ -1235,12 +1295,38 @@ const cancelTicket = async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Fetch ticket with schedule details
+      // Fetch ticket with trip details from either schedules or bus_schedules
       const ticketQuery = `
-        SELECT t.*, s.departure_time, s.schedule_date, s.available_seats, s.booked_seats, t.status as previous_status
+        SELECT t.*,
+               COALESCE(
+                 s.departure_time::text,
+                 bs.time::text,
+                 NULLIF(to_jsonb(t)->>'departure_time', ''),
+                 NULLIF(to_jsonb(t)->>'trip_time', '')
+               ) AS departure_time,
+               COALESCE(
+                 s.schedule_date::date,
+                 bs.date::date,
+                 CASE
+                   WHEN NULLIF(to_jsonb(t)->>'trip_date', '') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+                   THEN (to_jsonb(t)->>'trip_date')::date
+                   ELSE NULL
+                 END,
+                 CASE
+                   WHEN NULLIF(to_jsonb(t)->>'schedule_date', '') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+                   THEN (to_jsonb(t)->>'schedule_date')::date
+                   ELSE NULL
+                 END
+               ) AS schedule_date,
+               s.available_seats,
+               s.booked_seats,
+               t.status as previous_status
         FROM tickets t
-        INNER JOIN schedules s ON t.schedule_id = s.id
-        WHERE t.id = $1 AND t.passenger_id = $2
+        LEFT JOIN schedules s ON t.schedule_id = s.id
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        WHERE (t.id::text = $1 OR t.booking_ref = $1)
+          AND t.passenger_id = $2
+        LIMIT 1
       `;
       
       const ticketResult = await client.query(ticketQuery, [ticketId, userId]);
@@ -1256,6 +1342,7 @@ const cancelTicket = async (req, res) => {
       }
 
       const ticket = ticketResult.rows[0];
+      const resolvedTicketId = ticket.id;
       const previousStatus = ticket.previous_status;
 
       // Check if ticket is already cancelled or checked in
@@ -1279,28 +1366,62 @@ const cancelTicket = async (req, res) => {
         });
       }
 
-      // Check 10-minute rule
-      const departureTime = ticket.departure_time;
-      const now = new Date();
-      const departure = new Date(departureTime);
-      const timeDiffMinutes = (departure.getTime() - now.getTime()) / (1000 * 60);
-
-      if (timeDiffMinutes < 10) {
+      if (String(previousStatus || '').toUpperCase() !== 'CONFIRMED') {
         await client.query('ROLLBACK');
         client.release();
-        return res.status(400).json({ 
+        return res.status(400).json({
           success: false,
-          error: 'Ticket cannot be cancelled less than 10 minutes before departure',
-          message: 'Ticket cannot be cancelled less than 10 minutes before departure',
-          minutesRemaining: Math.round(timeDiffMinutes)
+          error: `Only confirmed tickets can be cancelled. Current status: ${previousStatus || 'UNKNOWN'}`,
+          message: `Only confirmed tickets can be cancelled. Current status: ${previousStatus || 'UNKNOWN'}`,
         });
       }
 
-      // Update ticket status to CANCELLED
-      await client.query(
-        'UPDATE tickets SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-        ['CANCELLED', ticketId]
+      // Check 15-minute cancellation window before departure
+      const departureTime = ticket.departure_time;
+      const scheduleDate = ticket.schedule_date;
+      const now = new Date();
+      const normalizedDate = scheduleDate ? String(scheduleDate).slice(0, 10) : '';
+      const normalizedTime = departureTime ? String(departureTime).slice(0, 8) : '';
+
+      const departureSource = normalizedDate
+        ? `${normalizedDate}T${normalizedTime || '23:59:59'}`
+        : departureTime;
+      const departure = new Date(departureSource);
+
+      if (!Number.isNaN(departure.getTime())) {
+        const timeDiffMinutes = (departure.getTime() - now.getTime()) / (1000 * 60);
+
+        if (timeDiffMinutes < 15) {
+          await client.query('ROLLBACK');
+          client.release();
+          return res.status(400).json({ 
+            success: false,
+            error: 'Ticket cannot be cancelled less than 15 minutes before departure',
+            message: 'Ticket cannot be cancelled less than 15 minutes before departure',
+            minutesRemaining: Math.round(timeDiffMinutes)
+          });
+        }
+      }
+
+      // Update ticket status to CANCELLED (strict confirmed -> cancelled transition)
+      const cancelUpdate = await client.query(
+        `UPDATE tickets
+         SET status = $1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = $2
+           AND UPPER(COALESCE(status::text, '')) = 'CONFIRMED'
+         RETURNING id`,
+        ['CANCELLED', resolvedTicketId]
       );
+
+      if (!cancelUpdate.rowCount) {
+        await client.query('ROLLBACK');
+        client.release();
+        return res.status(409).json({
+          success: false,
+          error: 'Ticket status changed before cancellation. Please refresh and try again.',
+          message: 'Ticket status changed before cancellation. Please refresh and try again.',
+        });
+      }
 
       // Unlock the seat
       const seatNumber = ticket.seat_number;
@@ -1309,23 +1430,39 @@ const cancelTicket = async (req, res) => {
         [ticket.schedule_id, seatNumber]
       );
 
-      // Update schedule seat counts
-      const newAvailableSeats = ticket.available_seats + 1;
-      const newBookedSeats = ticket.booked_seats - 1;
-      
-      await client.query(
-        'UPDATE schedules SET available_seats = $1, booked_seats = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
-        [newAvailableSeats, newBookedSeats, ticket.schedule_id]
-      );
+      // Update legacy schedules seat counts when ticket belongs to schedules.
+      if (typeof ticket.available_seats === 'number' && typeof ticket.booked_seats === 'number') {
+        const newAvailableSeats = ticket.available_seats + 1;
+        const newBookedSeats = Math.max(ticket.booked_seats - 1, 0);
+
+        await client.query(
+          'UPDATE schedules SET available_seats = $1, booked_seats = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
+          [newAvailableSeats, newBookedSeats, ticket.schedule_id]
+        );
+      }
 
       await client.query('COMMIT');
       client.release();
+
+      (async () => {
+        try {
+          await NotificationService.createNotification(
+            userId,
+            'Ticket Cancelled',
+            `Your ticket ${ticket.booking_ref || resolvedTicketId} was cancelled successfully.`,
+            'ticket_cancelled',
+            { relatedId: resolvedTicketId, relatedType: 'ticket' }
+          );
+        } catch (notifyErr) {
+          console.error('Cancel ticket notification error:', notifyErr.message);
+        }
+      })();
 
       res.json({ 
         success: true,
         message: 'Ticket cancelled successfully',
         ticket: {
-          id: ticket.id,
+          id: resolvedTicketId,
           status: 'CANCELLED'
         }
       });

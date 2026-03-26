@@ -6,6 +6,7 @@ const ctrl = require('../controllers/driverController');
 
 // Canonical driver (User) endpoints
 router.get('/me', authenticate, requireRoles(['driver']), ctrl.getMe);
+router.patch('/profile', authenticate, requireRoles(['driver']), ctrl.updateMyProfile);
 router.get('/bus', authenticate, requireRoles(['driver']), ctrl.getAssignedBus);
 router.get('/today-schedule', authenticate, requireRoles(['driver']), ctrl.getTodaySchedule);
 router.get('/schedules', authenticate, requireRoles(['driver']), ctrl.getDriverSchedules);

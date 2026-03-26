@@ -31,7 +31,7 @@ const corsOptions = {
     
     const allowedOrigins = [
       'http://localhost:5173',
-      'https://backend-7cxc.onrender.com/api/$1',
+      'https://backend-v2-wjcs.onrender.com/api/$1',
       'http://127.0.0.1:5173',
       'http://127.0.0.1:5000',
       'https://africastalking.com', // Africa's Talking sandbox
@@ -101,9 +101,9 @@ app.get('/', (req, res) => {
 app.use("/api", activityLogger, routes);
 
 // =====================
-// QR TICKET SCAN ENDPOINT (public — opened by phone after scanning QR)
+// QR TICKET VERIFY ENDPOINT (public — opened by phone after scanning QR)
 // GET /scan/:ticketId
-// Returns an HTML page showing ticket validity status and marks ticket as USED
+// Returns an HTML page showing ticket validity status (no check-in mutation)
 // =====================
 app.get('/scan/:ticketId', async (req, res) => {
   const pool = require('./config/pgPool');
@@ -219,11 +219,8 @@ app.get('/scan/:ticketId', async (req, res) => {
       }));
     }
 
-    // Valid ticket — mark as CHECKED_IN/USED
-    await client.query(
-      `UPDATE tickets SET status = 'CHECKED_IN', checked_in_at = NOW(), updated_at = NOW() WHERE id = $1`,
-      [ticket.id]
-    );
+    // Valid ticket — verification only. Do NOT mutate ticket status here.
+    // Driver check-in must happen through authenticated /api/driver/scan flow.
 
     const dateStr = ticket.dep_date ? String(ticket.dep_date).slice(0, 10) : '—';
     const timeStr = ticket.dep_time ? String(ticket.dep_time).slice(0, 5) : '—';
@@ -231,8 +228,8 @@ app.get('/scan/:ticketId', async (req, res) => {
     if (wantsJson) {
       return res.status(200).json({
         valid: true,
-        status: 'CHECKED_IN',
-        message: 'Ticket valid – passenger checked in',
+        status: 'CONFIRMED',
+        message: 'Ticket valid',
         ticket: {
           bookingRef: ticket.booking_ref,
           passengerName: ticket.passenger_name,
@@ -247,7 +244,7 @@ app.get('/scan/:ticketId', async (req, res) => {
     }
 
     return res.send(renderHtml('Ticket Valid ✓', '✅', '#dcfce7', {
-      sub: 'Welcome aboard! Passenger is cleared to board.',
+      sub: 'Ticket is valid. Driver must scan to check in passenger.',
       rows: [
         ['Passenger', ticket.passenger_name || '—'],
         ['Route', `${ticket.route_from} → ${ticket.route_to}`],
@@ -349,41 +346,83 @@ const connectDatabase = async () => {
 // =====================
 const initializeBackgroundTasks = () => {
   const { SeatLock, Ticket } = require('./models');
+  const paymentController = require('./controllers/paymentController');
+  let cleanupRunning = false;
+  let paymentCleanupRunning = false;
   
   // Expire seat locks
   const expireLocks = async () => {
+    if (cleanupRunning) return;
+    cleanupRunning = true;
     try {
       const now = new Date();
-      const expired = await SeatLock.findAll({ 
-        where: { 
-          status: 'ACTIVE', 
-          expires_at: { [Op.lte]: now } 
-        } 
-      });
-      
-      for (const lock of expired) {
-        try {
-          lock.status = 'EXPIRED';
-          await lock.save();
-          
-          if (lock.ticket_id) {
-            const ticket = await Ticket.findByPk(lock.ticket_id);
-            if (ticket && ticket.status === 'PENDING_PAYMENT') {
-              ticket.status = 'EXPIRED';
-              await ticket.save();
-            }
-          }
-        } catch (e) {
-          console.error('Failed to expire lock', lock.id, e.message || e);
+      const [expiredCount, expiredRows] = await SeatLock.update(
+        {
+          status: 'EXPIRED',
+          updated_at: now,
+        },
+        {
+          where: {
+            status: 'ACTIVE',
+            expires_at: { [Op.lte]: now },
+          },
+          returning: ['id', 'ticket_id'],
         }
+      );
+
+      const expiredTicketIds = (expiredRows || [])
+        .map((row) => row.ticket_id)
+        .filter(Boolean);
+
+      if (expiredTicketIds.length > 0) {
+        await Ticket.update(
+          {
+            status: 'EXPIRED',
+            updated_at: now,
+          },
+          {
+            where: {
+              id: { [Op.in]: expiredTicketIds },
+              status: 'PENDING_PAYMENT',
+            },
+          }
+        );
+      }
+
+      if (expiredCount > 0) {
+        console.log(`⏰ Expired ${expiredCount} seat lock(s)`);
       }
     } catch (err) {
       console.error('expireLocks error', err.message || err);
+    } finally {
+      cleanupRunning = false;
     }
   };
 
-  // Run every 30 seconds
-  setInterval(expireLocks, 30 * 1000);
+  const expirePendingPayments = async () => {
+    if (paymentCleanupRunning) return;
+    paymentCleanupRunning = true;
+    try {
+      const expiredCount = await paymentController.expirePendingPayments();
+      if (expiredCount > 0) {
+        console.log(`💳 Expired ${expiredCount} pending payment hold(s)`);
+      }
+    } catch (err) {
+      console.error('expirePendingPayments error', err.message || err);
+    } finally {
+      paymentCleanupRunning = false;
+    }
+  };
+
+  // Run immediately, then every 30 seconds
+  expireLocks().catch((err) => console.error('Initial expireLocks error', err.message || err));
+  expirePendingPayments().catch((err) => console.error('Initial expirePendingPayments error', err.message || err));
+  setInterval(() => {
+    expireLocks().catch((err) => console.error('Scheduled expireLocks error', err.message || err));
+  }, 30 * 1000);
+  setInterval(() => {
+    expirePendingPayments().catch((err) => console.error('Scheduled expirePendingPayments error', err.message || err));
+  }, 30 * 1000);
   console.log('⏰ Background tasks initialized');
 };
 

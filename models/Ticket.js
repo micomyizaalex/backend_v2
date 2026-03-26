@@ -16,6 +16,12 @@ const Ticket = sequelize.define(
     payment_id: { type: DataTypes.UUID, allowNull: true },
 
     seat_number: { type: DataTypes.STRING, allowNull: false },
+    route_id: { type: DataTypes.STRING, allowNull: true },
+    trip_date: { type: DataTypes.DATEONLY, allowNull: true },
+    from_stop: { type: DataTypes.STRING, allowNull: true },
+    to_stop: { type: DataTypes.STRING, allowNull: true },
+    from_sequence: { type: DataTypes.INTEGER, allowNull: true },
+    to_sequence: { type: DataTypes.INTEGER, allowNull: true },
     booking_ref: { type: DataTypes.STRING, allowNull: false, unique: true },
     qr_code_url: DataTypes.TEXT,
     price: { type: DataTypes.DECIMAL, allowNull: false },

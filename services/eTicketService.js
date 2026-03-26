@@ -41,6 +41,28 @@ const generateQRCode = async (data) => {
 };
 
 /**
+ * Generate QR code PNG buffer for CID embedding in emails.
+ * CID images are far more reliable than data URLs in Gmail/mobile clients.
+ */
+const generateQRCodeBuffer = async (data) => {
+  try {
+    return await QRCode.toBuffer(JSON.stringify(data), {
+      errorCorrectionLevel: 'M',
+      type: 'png',
+      margin: 1,
+      width: 220,
+      color: {
+        dark: '#2B2D42',
+        light: '#FFFFFF'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Failed to generate QR buffer:', error);
+    return null;
+  }
+};
+
+/**
  * Safe date formatter with fallbacks
  */
 const formatDate = (dateValue) => {
@@ -108,7 +130,7 @@ const formatTime = (timeValue) => {
 /**
  * Generate professional e-ticket HTML template - Production Ready
  */
-const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData }) => {
+const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData, qrImageSrc = null }) => {
   try {
     console.log('🎨 Generating e-ticket HTML...');
     console.log('📊 Trip data received:', {
@@ -120,19 +142,22 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
     });
     
     // Generate QR code with error handling
-    let qrCodeImage = null;
-    try {
-      qrCodeImage = await generateQRCode(qrData);
-      if (qrCodeImage) {
-        const qrSize = (qrCodeImage.length * 0.75 / 1024).toFixed(2);
-        console.log(`✅ QR code ready for email: ${qrSize} KB, length: ${qrCodeImage.length} chars`);
-        console.log(`🔍 QR starts with: ${qrCodeImage.substring(0, 30)}...`);
-      } else {
-        console.log('⚠️  QR code generation returned null, email will show fallback message');
+    // Prefer CID image (passed in from sendETicketEmail) for better client support.
+    // Fallback to data URL if CID wasn't available.
+    let qrCodeImage = qrImageSrc;
+    if (!qrCodeImage) {
+      try {
+        qrCodeImage = await generateQRCode(qrData);
+        if (qrCodeImage) {
+          const qrSize = (qrCodeImage.length * 0.75 / 1024).toFixed(2);
+          console.log(`✅ QR code data-url fallback ready: ${qrSize} KB, length: ${qrCodeImage.length} chars`);
+        } else {
+          console.log('⚠️  QR code generation returned null, email will show fallback message');
+        }
+      } catch (qrError) {
+        console.error('❌ QR generation failed:', qrError);
+        qrCodeImage = null;
       }
-    } catch (qrError) {
-      console.error('❌ QR generation failed:', qrError);
-      qrCodeImage = null;
     }
     
     // Safe date formatting with fallbacks
@@ -144,6 +169,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
     console.log('📱 QR code will be shown:', qrCodeImage ? 'YES' : 'NO (showing fallback)');
     
     const ticketId = `STX-${new Date().getFullYear()}-${String(ticket.id).substring(0, 6).toUpperCase()}`;
+    const ticketIdsDisplay = ticket.ticketIds || ticket.id;
   
   return `
 <!DOCTYPE html>
@@ -190,8 +216,8 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
               <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
                 <tr>
                   <td style="text-align: left;">
-                    <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Ticket ID</p>
-                    <p style="margin: 5px 0 0 0; color: #0077B6; font-size: 18px; font-weight: bold; font-family: 'Courier New', monospace;">${ticketId}</p>
+                    <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Ticket ID(s)</p>
+                    <p style="margin: 5px 0 0 0; color: #0077B6; font-size: 18px; font-weight: bold; font-family: 'Courier New', monospace;">${ticketIdsDisplay}</p>
                   </td>
                   <td style="text-align: right;">
                     <p style="margin: 0; color: #64748B; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Booking Ref</p>
@@ -202,6 +228,14 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
             </td>
           </tr>
           
+          <!-- Greeting -->
+          <tr>
+            <td style="padding: 22px 40px 0 40px;">
+              <p style="margin: 0; color: #2B2D42; font-size: 15px; line-height: 1.5;">Hello ${passenger.name},</p>
+              <p style="margin: 8px 0 0 0; color: #475569; font-size: 14px; line-height: 1.6;">Your SafariTix booking is confirmed. Please find your ticket details below.</p>
+            </td>
+          </tr>
+
           <!-- Passenger Information -->
           <tr>
             <td style="padding: 30px 40px; border-bottom: 1px solid #E2E8F0;">
@@ -294,7 +328,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
                 <tr>
                   <td style="width: 50%; padding: 12px 8px 12px 0; vertical-align: top;">
                     <div style="background-color: #FFFFFF; padding: 15px; border-radius: 8px; border-left: 4px solid #27AE60; height: 100%; box-sizing: border-box;">
-                      <p style="margin: 0 0 5px 0; color: #64748B; font-size: 11px; text-transform: uppercase; font-weight: 600;">Seat Number</p>
+                      <p style="margin: 0 0 5px 0; color: #64748B; font-size: 11px; text-transform: uppercase; font-weight: 600;">Seat Number(s)</p>
                       <p style="margin: 0; color: #27AE60; font-size: 20px; font-weight: bold;">${ticket.seatNumber}</p>
                     </div>
                   </td>
@@ -368,7 +402,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
                       <tr>
                         <td align="center" style="padding: 15px; background-color: #FFFFFF; border-radius: 12px; border: 2px solid #0077B6;">
                           <img src="${qrCodeImage}" alt="Boarding Pass QR Code" width="140" height="140" border="0" style="display: block; width: 140px; height: 140px; margin: 0 auto;" />
-                          <p style="margin: 10px 0 0 0; color: #64748B; font-size: 11px; font-weight: 600;">Scan at boarding</p>
+                          <p style="margin: 10px 0 0 0; color: #64748B; font-size: 11px; font-weight: 600;">Please present this QR code when boarding</p>
                         </td>
                       </tr>
                     </table>
@@ -399,6 +433,11 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
                         <td style="padding: 0 10px;">
                           <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/tickets/${ticket.id}" style="display: inline-block; background-color: #0077B6; color: #FFFFFF; text-decoration: none; padding: 14px 28px; border-radius: 8px; font-size: 14px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px;">
                             View Ticket
+                          </a>
+                        </td>
+                        <td style="padding: 0 10px;">
+                          <a href="${process.env.FRONTEND_URL || 'http://localhost:5173'}/track-bus/${ticket.id}" style="display: inline-block; background-color: #27AE60; color: #FFFFFF; text-decoration: none; padding: 14px 28px; border-radius: 8px; font-size: 14px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px;">
+                            Track Bus
                           </a>
                         </td>
                         <td style="padding: 0 10px;">
@@ -501,6 +540,7 @@ const generateETicketHTML = async ({ ticket, passenger, trip, company, qrData })
  */
 const generateETicketText = ({ ticket, passenger, trip, company }) => {
   const ticketId = `STX-${new Date().getFullYear()}-${String(ticket.id).substring(0, 6).toUpperCase()}`;
+  const ticketIdsDisplay = ticket.ticketIds || ticket.id;
   
   // Safe date formatting for plain text
   const formattedDate = formatDate(trip.date);
@@ -514,9 +554,12 @@ const generateETicketText = ({ ticket, passenger, trip, company }) => {
 
 ✓ BOOKING CONFIRMED
 
+Hello ${passenger.name},
+Your SafariTix booking is confirmed.
+
 TICKET INFORMATION
 ──────────────────────────────────────────────────────────
-Ticket ID:       ${ticketId}
+Ticket ID(s):    ${ticketIdsDisplay}
 Booking Ref:     ${ticket.bookingRef}
 Status:          CONFIRMED
 
@@ -531,7 +574,7 @@ JOURNEY DETAILS
 Route:           ${trip.origin} → ${trip.destination}
 Date:            ${formattedDate}
 Departure:       ${formattedTime}
-Seat Number:     ${ticket.seatNumber}
+Seat Number(s):  ${ticket.seatNumber}
 Bus Number:      ${trip.busNumber || 'Will be assigned'}
 ${trip.driverName ? `Driver:          ${trip.driverName}\n` : ''}
 
@@ -545,6 +588,7 @@ IMPORTANT BOARDING INFORMATION
 ──────────────────────────────────────────────────────────
 ⚠ Please arrive at least 30 minutes before departure time
 ⚠ Have this ticket ready for verification
+⚠ Please present this QR code when boarding
 ⚠ Carry a valid ID for identification
 ⚠ Luggage restrictions apply as per company policy
 ⚠ Ticket is non-transferable
@@ -570,7 +614,9 @@ const sendETicketEmail = async ({
   userName,
   tickets,
   scheduleInfo,
-  companyInfo = {}
+  companyInfo = {},
+  bookingId = null,
+  userId = null
 }) => {
   try {
     console.log('📧 ===== E-TICKET EMAIL GENERATION STARTED =====');
@@ -587,9 +633,16 @@ const sendETicketEmail = async ({
       return { success: false, error: 'No tickets provided' };
     }
 
-    // For now, send individual emails for each ticket
-    // In production, you might want to combine multiple tickets into one email
     const ticket = tickets[0];
+    const seatNumbers = tickets
+      .map((item) => item?.seat_number || item?.seatNumber)
+      .filter(Boolean)
+      .map((seat) => String(seat));
+    const ticketIds = tickets
+      .map((item) => item?.id)
+      .filter(Boolean)
+      .map((id) => String(id));
+    const totalPrice = tickets.reduce((sum, item) => sum + Number(item?.price || 0), 0);
     
     console.log('🎫 Processing ticket:', {
       id: ticket.id,
@@ -622,29 +675,47 @@ const sendETicketEmail = async ({
     console.log('📅 Formatted date:', formattedDate);
     console.log('🕐 Formatted time:', formattedTime);
     
-    // Prepare QR code data (optimized for smaller size)
+    // Prepare QR code data.
+    // Required payload schema:
+    // {
+    //   bookingId,
+    //   userId,
+    //   from,
+    //   to,
+    //   seats,
+    //   date,
+    //   bus
+    // }
+    //
+    // NOTE: We also include `ticketId` for backward compatibility with
+    // existing driver scanning/validation logic (which extracts ticketId).
     const qrData = {
-      t: ticket.id || `temp-${Date.now()}`, // ticketId (shortened key)
-      b: ticket.booking_ref || ticket.bookingRef, // bookingRef
-      s: ticket.seat_number || ticket.seatNumber, // seatNumber
-      o: scheduleInfo?.origin || 'N/A', // origin
-      d: scheduleInfo?.destination || 'N/A', // destination
-      dt: combinedDateTime || scheduleDate || new Date().toISOString().split('T')[0], // date
-      v: `${process.env.APP_URL || 'https://backend-7cxc.onrender.com/api/$1'}/api/tickets/verify/${ticket.id || ticket.bookingRef}` // verificationUrl
+      bookingId: bookingId || ticket.payment_id || ticket.booking_id || ticket.booking_ref || null,
+      userId: userId || ticket.passenger_id || ticket.user_id || null,
+      from: scheduleInfo?.origin || scheduleInfo?.from || 'N/A',
+      to: scheduleInfo?.destination || scheduleInfo?.to || 'N/A',
+      seats: seatNumbers.map((s) => String(s)),
+      date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || scheduleDate || null,
+      bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || scheduleInfo?.bus || null,
+      ticketId: ticket.id || ticket.ticket_id || null
     };
     
-    console.log('📱 QR Data prepared (optimized):', {
-      ticketId: qrData.t,
-      bookingRef: qrData.b,
+    console.log('📱 QR Data prepared:', {
+      bookingId: qrData.bookingId,
+      userId: qrData.userId,
+      from: qrData.from,
+      to: qrData.to,
+      seatsCount: Array.isArray(qrData.seats) ? qrData.seats.length : 0,
       dataSize: JSON.stringify(qrData).length + ' bytes'
     });
 
     // Prepare ticket data for template
     const ticketData = {
       id: ticket.id || `temp-${Date.now()}`,
+      ticketIds: ticketIds.join(', '),
       bookingRef: ticket.booking_ref || ticket.bookingRef,
-      seatNumber: ticket.seat_number || ticket.seatNumber,
-      price: ticket.price || 0
+      seatNumber: seatNumbers.length ? seatNumbers.join(', ') : (ticket.seat_number || ticket.seatNumber),
+      price: totalPrice || ticket.price || 0
     };
 
     const passengerData = {
@@ -674,6 +745,11 @@ const sendETicketEmail = async ({
       busNumber: tripData.busNumber
     });
 
+    // Generate a CID-embedded image for reliable rendering in Gmail and mobile email apps.
+    const qrCid = `boarding-pass-qr-${Date.now()}@safaritix`;
+    const qrBuffer = await generateQRCodeBuffer(qrData);
+    const qrImageSrc = qrBuffer ? `cid:${qrCid}` : null;
+
     // Generate email content with comprehensive error handling
     let html;
     try {
@@ -682,7 +758,8 @@ const sendETicketEmail = async ({
         passenger: passengerData,
         trip: tripData,
         company: companyData,
-        qrData
+        qrData,
+        qrImageSrc
       });
       console.log('✅ HTML template generated successfully');
     } catch (htmlError) {
@@ -697,7 +774,7 @@ const sendETicketEmail = async ({
       company: companyData
     });
 
-    const subject = `🎫 SafariTix E-Ticket: ${tripData.origin} → ${tripData.destination} | Seat ${ticketData.seatNumber}`;
+    const subject = 'Your SafariTix Ticket Confirmation';
     
     console.log('📬 Sending email...');
     console.log('   To:', userEmail);
@@ -707,7 +784,17 @@ const sendETicketEmail = async ({
       to: userEmail,
       subject,
       text,
-      html
+      html,
+      attachments: qrBuffer
+        ? [
+            {
+              filename: 'boarding-pass-qr.png',
+              content: qrBuffer,
+              cid: qrCid,
+              contentType: 'image/png'
+            }
+          ]
+        : []
     });
 
     console.log('✅ ===== E-TICKET EMAIL SENT SUCCESSFULLY =====');

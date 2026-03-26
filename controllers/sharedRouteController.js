@@ -13,7 +13,22 @@ const toInt = (value, fallback = 0) => {
   return Number.isFinite(n) ? Math.trunc(n) : fallback;
 };
 
+const hasScheduleDeparturePassed = async (client, dateValue, timeValue) => {
+  if (!dateValue || !timeValue) return false;
+
+  const result = await client.query(
+    `
+      SELECT
+        ($1::date + $2::time) <= (NOW() AT TIME ZONE 'Africa/Kigali') AS has_departed
+    `,
+    [dateValue, timeValue]
+  );
+
+  return Boolean(result.rows[0]?.has_departed);
+};
+
 const normalizeStopName = (value) => (value || '').toString().trim().toLowerCase();
+const SEAT_HOLD_STATUSES = ['PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN'];
 let scheduleTableCache = null;   // reset to null so bus_schedules is detected after migration
 const tableColumnsCache = {};
 
@@ -82,6 +97,12 @@ const overlapsSegment = (aFrom, aTo, bFrom, bTo) => {
   return aFrom < bTo && bFrom < aTo;
 };
 
+const parseSequence = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+};
+
 const getSegmentFare = async (client, fromStop, toStop, effectiveDate) => {
   const result = await client.query(
     `
@@ -108,6 +129,31 @@ const getScheduleOccupancy = async (client, scheduleId, routeStops, fromStop, to
     return { occupiedSeats: new Set(), fromSeq, toSeq };
   }
 
+  const routeMinSeq = routeStops.length ? toInt(routeStops[0].sequence, 0) : 0;
+  const routeMaxSeq = routeStops.length ? toInt(routeStops[routeStops.length - 1].sequence, 0) : 0;
+  const ticketsColumns = await getTableColumns(client, 'tickets');
+  const hasSequenceColumns = ticketsColumns.has('from_sequence') && ticketsColumns.has('to_sequence');
+
+  if (hasSequenceColumns) {
+    const occupied = await client.query(
+      `
+        SELECT DISTINCT seat_number
+        FROM tickets
+        WHERE schedule_id::text = $1::text
+          AND COALESCE(status::text, 'CONFIRMED') = ANY($2::text[])
+          AND from_sequence < $3
+          AND to_sequence > $4
+      `,
+      [scheduleId, SEAT_HOLD_STATUSES, toSeq, fromSeq]
+    );
+
+    return {
+      occupiedSeats: new Set(occupied.rows.map((row) => String(row.seat_number))),
+      fromSeq,
+      toSeq
+    };
+  }
+
   const ticketsResult = await client.query(
     `
       SELECT
@@ -117,15 +163,24 @@ const getScheduleOccupancy = async (client, scheduleId, routeStops, fromStop, to
         COALESCE(status::text, 'CONFIRMED') AS status
       FROM tickets
       WHERE schedule_id::text = $1::text
+        AND COALESCE(status::text, 'CONFIRMED') = ANY($2::text[])
     `,
-    [scheduleId]
+    [scheduleId, SEAT_HOLD_STATUSES]
   );
 
   const occupiedSeats = new Set();
   for (const ticket of ticketsResult.rows) {
-    if ((ticket.status || '').toString().toUpperCase() === 'CANCELLED') continue;
-    const ticketFrom = findStopSequence(routeStops, ticket.from_stop);
-    const ticketTo = findStopSequence(routeStops, ticket.to_stop);
+    let ticketFrom = parseSequence(ticket.from_sequence);
+    let ticketTo = parseSequence(ticket.to_sequence);
+
+    if (ticketFrom === null) ticketFrom = findStopSequence(routeStops, ticket.from_stop);
+    if (ticketTo === null) ticketTo = findStopSequence(routeStops, ticket.to_stop);
+
+    // Legacy tickets without explicit segment data block the full route.
+    if (ticketFrom === null || ticketFrom < 0) ticketFrom = routeMinSeq;
+    if (ticketTo === null || ticketTo < 0) ticketTo = routeMaxSeq;
+    if (ticketFrom >= ticketTo) continue;
+
     if (overlapsSegment(fromSeq, toSeq, ticketFrom, ticketTo)) {
       occupiedSeats.add(String(ticket.seat_number));
     }
@@ -447,6 +502,7 @@ const listSharedSchedules = async (req, res) => {
               bs.id AS schedule_id,
               bs.bus_id,
               bs.route_id,
+              bs.company_id,
               bs.schedule_date AS date,
               bs.departure_time AS time,
               COALESCE(bs.total_seats, bs.available_seats + bs.booked_seats) AS capacity,
@@ -531,6 +587,7 @@ const searchSharedSchedules = async (req, res) => {
               bs.id AS schedule_id,
               bs.bus_id,
               bs.route_id,
+              bs.company_id,
               bs.schedule_date AS date,
               bs.departure_time AS time,
               COALESCE(bs.total_seats, bs.available_seats + bs.booked_seats) AS capacity,
@@ -709,6 +766,7 @@ const searchTrips = async (req, res) => {
       const queryParams = [routeMatch.route_id];
 
       const dateCol = tableName === 'bus_schedules' ? 'bs.date' : 'bs.schedule_date';
+      const timeCol = tableName === 'bus_schedules' ? 'bs.time' : 'bs.departure_time';
       if (date) {
         queryParams.push(date);
         whereConditions.push(`${dateCol}::date = $${queryParams.length}::date`);
@@ -716,6 +774,17 @@ const searchTrips = async (req, res) => {
         // Without a date filter, only show upcoming schedules
         whereConditions.push(`${dateCol}::date >= CURRENT_DATE`);
       }
+
+      // Schedules are not bookable once departure time is reached.
+      whereConditions.push(
+        `(
+          ${dateCol}::date > (NOW() AT TIME ZONE 'Africa/Kigali')::date
+          OR (
+            ${dateCol}::date = (NOW() AT TIME ZONE 'Africa/Kigali')::date
+            AND ${timeCol}::time > (NOW() AT TIME ZONE 'Africa/Kigali')::time
+          )
+        )`
+      );
 
       const orderCol = tableName === 'bus_schedules' ? 'bs.date, bs.time' : 'bs.schedule_date, bs.departure_time';
       const schedulesResult = await client.query(
@@ -836,6 +905,11 @@ const getAvailableSeats = async (req, res) => {
     }
 
     const schedule = scheduleResult.rows[0];
+    const scheduleDeparted = await hasScheduleDeparturePassed(client, schedule.date, schedule.time);
+    if (scheduleDeparted) {
+      return res.status(400).json({ success: false, message: 'This trip has already departed' });
+    }
+
     const routeStops = await getStopsByRoute(client, schedule.route_id);
     if (routeStops.length < 2) {
       return res.status(400).json({ success: false, message: 'Route stops are not configured' });
@@ -942,6 +1016,12 @@ const bookSharedTicket = async (req, res) => {
     }
 
     const schedule = scheduleResult.rows[0];
+    const scheduleDeparted = await hasScheduleDeparturePassed(client, schedule.date, schedule.time);
+    if (scheduleDeparted) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'This trip has already departed' });
+    }
+
     if ((schedule.status || '').toLowerCase() === 'cancelled') {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'Schedule is cancelled' });
@@ -969,18 +1049,50 @@ const bookSharedTicket = async (req, res) => {
       return res.status(400).json({ success: false, message: 'No seats available for selected segment' });
     }
 
+    const seatInventory = await client.query(
+      `
+        SELECT seat_number, COALESCE(is_driver, false) AS is_driver
+        FROM seats
+        WHERE bus_id::text = $1::text
+      `,
+      [schedule.bus_id]
+    );
+    const seatMetaByNumber = new Map(
+      seatInventory.rows.map((row) => [String(row.seat_number), Boolean(row.is_driver)])
+    );
+
     let selectedSeat = seat_number ? String(seat_number) : null;
+    if (selectedSeat) {
+      const parsedSeat = Number(selectedSeat);
+      if (!Number.isInteger(parsedSeat) || parsedSeat < 1 || parsedSeat > capacity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: 'Selected seat_number is out of range' });
+      }
+    }
+
+    if (selectedSeat && seatMetaByNumber.get(selectedSeat) === true) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Driver seat cannot be booked' });
+    }
+
     if (selectedSeat && occupancy.occupiedSeats.has(selectedSeat)) {
       await client.query('ROLLBACK');
       return res.status(409).json({ success: false, message: 'Selected seat is not available for this segment' });
     }
+
     if (!selectedSeat) {
       for (let seat = 1; seat <= capacity; seat += 1) {
-        if (!occupancy.occupiedSeats.has(String(seat))) {
-          selectedSeat = String(seat);
+        const candidate = String(seat);
+        if (!occupancy.occupiedSeats.has(candidate) && seatMetaByNumber.get(candidate) !== true) {
+          selectedSeat = candidate;
           break;
         }
       }
+    }
+
+    if (!selectedSeat) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'No passenger seats available for selected segment' });
     }
 
     const passengerId = req.userId || req.body.passenger_id || null;
@@ -1011,8 +1123,12 @@ const bookSharedTicket = async (req, res) => {
     add('schedule_id', schedule.schedule_id);
     add('passenger_id', passengerId);
     add('company_id', schedule.company_id || null);
+    add('route_id', schedule.route_id);
+    add('trip_date', schedule.date ? String(schedule.date).slice(0, 10) : null);
     add('from_stop', from_stop);
     add('to_stop', to_stop);
+    add('from_sequence', occupancy.fromSeq);
+    add('to_sequence', occupancy.toSeq);
     add('seat_number', selectedSeat);
     add('price', segPrice);
     add('passenger_name', passenger_name || null);
@@ -1148,6 +1264,23 @@ const bookSharedTicket = async (req, res) => {
   } catch (error) {
     if (client) await client.query('ROLLBACK');
     console.error('bookSharedTicket error:', error);
+
+    // PostgreSQL exclusion constraint violation (seat overlap conflict).
+    if (error && error.code === '23P01') {
+      return res.status(409).json({
+        success: false,
+        message: 'Selected seat is no longer available for this segment. Please choose another seat.'
+      });
+    }
+
+    // PostgreSQL unique violation (e.g., duplicate booking_ref).
+    if (error && error.code === '23505') {
+      return res.status(409).json({
+        success: false,
+        message: 'Booking conflict detected. Please retry the booking.'
+      });
+    }
+
     res.status(500).json({ success: false, message: 'Failed to book ticket' });
   } finally {
     if (client) client.release();

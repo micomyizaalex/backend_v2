@@ -5,9 +5,17 @@ const auth = require('../middleware/authenticate');
 const { requireCompanyVerified } = require('../middleware/requireVerified');
 
 // All payment routes require authentication
+router.post('/booking-hold', auth, paymentController.createBookingHold);
+router.post('/demo-confirm', auth, paymentController.demoConfirmPayment);
 router.post('/initiate', auth, paymentController.initiatePayment);
+router.get('/:paymentId/status', auth, paymentController.getPaymentStatus);
+router.post('/:paymentId/cancel', auth, paymentController.cancelPayment);
 router.post('/confirm', auth, paymentController.confirmPayment);
+router.post('/fail', auth, paymentController.failPayment);
 router.post('/book', auth, paymentController.bookTicket);
+
+// Provider callbacks must not require commuter auth.
+router.post('/webhook', paymentController.webhook);
 
 // Subscription purchase — requires company to be fully verified first
 router.post('/subscribe', auth, requireCompanyVerified, paymentController.initiatePayment);

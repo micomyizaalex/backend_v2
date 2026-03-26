@@ -1,83 +1,106 @@
-/**
+﻿/**
  * MTN Mobile Money Payment Service
- * Integrates with MTN Mobile Money API for payment processing
- * Supports both Sandbox and Production environments
- * 
- * Set MTN_USE_MOCK=true in .env to use mock service for testing
+ * Integrates with MTN Mobile Money API for payment processing.
+ *
+ * Credential detection is LAZY (checked at call time, not at module load)
+ * so that dotenv has a chance to populate process.env before we read it.
+ *
+ * Auto-fallback rules:
+ *   MTN_USE_MOCK=true                      -> always use mock service
+ *   Credentials incomplete + non-production -> auto-use mock with a warning
+ *   Credentials incomplete + production     -> throw clearly
  */
 
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
 
-// Check if mock mode is enabled
-const USE_MOCK = process.env.MTN_USE_MOCK === 'true';
-
-// If mock mode is enabled, use mock service
-if (USE_MOCK) {
-  console.log('⚠️  MTN Mock Mode Enabled - Using simulated responses');
-  module.exports = require('./mtnMockService');
-  return;
-}
-
-// MTN API Configuration
-const MTN_CONFIG = {
-  // Sandbox environment URLs
-  SANDBOX_BASE_URL: 'https://sandbox.momodeveloper.mtn.com',
-  SANDBOX_COLLECTION_URL: 'https://sandbox.momodeveloper.mtn.com/collection',
-  
-  // Production environment URLs
-  PRODUCTION_BASE_URL: 'https://momodeveloper.mtn.com',
-  PRODUCTION_COLLECTION_URL: 'https://momodeveloper.mtn.com/collection',
-  
-  // API version
-  API_VERSION: 'v1_0',
-  
-  // Target environment (can be 'sandbox' or 'production')
-  TARGET_ENVIRONMENT: process.env.MTN_ENV || 'sandbox',
+const readEnv = (...keys) => {
+  for (const key of keys) {
+    const value = String(process.env[key] || '').trim();
+    if (!value) continue;
+    if (value.startsWith('REPLACE_')) continue;
+    return value;
+  }
+  return '';
 };
 
-/**
- * Get the base URL based on environment
- * @returns {string} Base URL for MTN API
- */
+const isUuid = (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || '').trim()
+  );
+
+// Resolved lazily on first call so dotenv has already run
+let _mockService = null;
+function getMockService() {
+  if (!_mockService) _mockService = require('./mtnMockService');
+  return _mockService;
+}
+
+function credentialsComplete() {
+  return Boolean(
+    readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY') &&
+    readEnv('MTN_CONSUMER_SECRET', 'PAYMENT_SECONDARY_KEY') &&
+    readEnv('MTN_API_USER')
+  );
+}
+
+function shouldUseMock() {
+  if (process.env.MTN_USE_MOCK === 'true') return true;
+  // In non-production: gracefully fall back to mock so development keeps working
+  if (!credentialsComplete() && process.env.NODE_ENV !== 'production') {
+    console.warn(
+      '[MTN] Credentials incomplete (MTN_CONSUMER_SECRET empty?). ' +
+      'Falling back to mock service for this request. ' +
+      'Fill MTN_CONSUMER_KEY, MTN_CONSUMER_SECRET and MTN_API_USER in .env to use real payments.'
+    );
+    return true;
+  }
+  return false;
+}
+
+const MTN_CONFIG = {
+  SANDBOX_COLLECTION_URL: 'https://sandbox.momodeveloper.mtn.com/collection',
+  PRODUCTION_COLLECTION_URL: 'https://proxy.momoapi.mtn.com/collection',
+  API_VERSION: 'v1_0',
+};
+
 function getBaseUrl() {
-  return MTN_CONFIG.TARGET_ENVIRONMENT === 'production'
+  return (process.env.MTN_ENV || 'sandbox') === 'production'
     ? MTN_CONFIG.PRODUCTION_COLLECTION_URL
     : MTN_CONFIG.SANDBOX_COLLECTION_URL;
 }
 
-/**
- * Get OAuth access token from MTN API
- * Required for authenticating API requests
- * 
- * @returns {Promise<string>} Access token
- * @throws {Error} If token generation fails
- */
 async function generateAccessToken() {
+  const consumerKey = readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY');
+  const consumerSecret = readEnv('MTN_CONSUMER_SECRET', 'PAYMENT_SECONDARY_KEY');
+  const apiUser = readEnv('MTN_API_USER');
+
+  if (!consumerKey || !consumerSecret || !apiUser) {
+    throw new Error(
+      'Missing MTN API credentials. Set MTN_CONSUMER_KEY, MTN_CONSUMER_SECRET and MTN_API_USER in .env'
+    );
+  }
+
+  if (!isUuid(apiUser)) {
+    throw new Error(
+      'MTN_API_USER must be a UUID from MTN sandbox provisioning (current value is not UUID format).'
+    );
+  }
+
+  // MTN token endpoint: Basic Auth = base64(apiUser:consumerSecret)
+  const authString = Buffer.from(`${apiUser}:${consumerSecret}`).toString('base64');
+
   try {
-    const consumerKey = process.env.MTN_CONSUMER_KEY;
-    const consumerSecret = process.env.MTN_CONSUMER_SECRET;
-    const apiUser = process.env.MTN_API_USER;
-
-    // Validate required environment variables
-    if (!consumerKey || !consumerSecret || !apiUser) {
-      throw new Error('Missing MTN API credentials. Check environment variables: MTN_CONSUMER_KEY, MTN_CONSUMER_SECRET, MTN_API_USER');
-    }
-
-    // Create Basic Auth credentials
-    const authString = Buffer.from(`${apiUser}:${consumerSecret}`).toString('base64');
-
-    // Request access token with retry logic
     const response = await axios.post(
-      `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/token/`,
+      `${getBaseUrl()}/token/`,
       {},
       {
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Basic ${authString}`,
+          Authorization: `Basic ${authString}`,
           'Ocp-Apim-Subscription-Key': consumerKey,
         },
-        timeout: 30000, // 30 second timeout (MTN can be slow)
+        timeout: 30000,
       }
     );
 
@@ -85,325 +108,222 @@ async function generateAccessToken() {
       throw new Error('Invalid token response from MTN API');
     }
 
-    console.log('✅ MTN Access Token generated successfully');
+    console.log('[MTN] Access token generated successfully');
     return response.data.access_token;
   } catch (error) {
-    if (error.code === 'ECONNABORTED') {
-      console.error('❌ MTN API Timeout: The request took too long. MTN Sandbox may be experiencing issues.');
-    } else if (error.response) {
-      console.error('❌ MTN API Error:', error.response.status, error.response.data);
-    } else {
-      console.error('❌ MTN Token Generation Error:', error.message);
-    }
-    
-    // Provide more specific error messages
     if (error.response) {
-      const status = error.response.status;
-      if (status === 401) {
-        throw new Error('MTN API authentication failed. Check your API credentials.');
-      } else if (status === 403) {
-        throw new Error('MTN API access forbidden. Verify your subscription key.');
+      const s = error.response.status;
+      console.error('[MTN] Token request failed', s, error.response.data);
+      if (s === 401) {
+        const keyPreview = consumerKey ? `${consumerKey.slice(0, 6)}...` : '(empty)';
+        const userPreview = apiUser ? `${apiUser.slice(0, 8)}...` : '(empty)';
+        throw new Error(
+          `MTN authentication failed (401). Active credentials: key=${keyPreview}, apiUser=${userPreview}. ` +
+          'Check that MTN_API_USER and MTN_CONSUMER_SECRET were generated together from MTN sandbox provisioning.'
+        );
       }
+      if (s === 403) throw new Error('MTN access forbidden - check MTN_CONSUMER_KEY (Ocp-Apim-Subscription-Key)');
+      throw new Error(`MTN token request failed (HTTP ${s}): ${JSON.stringify(error.response.data)}`);
     }
-    
+    if (error.code === 'ECONNABORTED') throw new Error('MTN API timeout - sandbox may be slow, retry later');
     throw new Error(`Failed to generate MTN access token: ${error.message}`);
   }
 }
 
-/**
- * Request to Pay - Initiate a payment request to MTN Mobile Money
- * This is the main function for processing payments
- * 
- * @param {Object} paymentData - Payment details
- * @param {number} paymentData.amount - Payment amount
- * @param {string} paymentData.currency - Currency code (e.g., 'RWF')
- * @param {string} paymentData.phoneNumber - Payer's phone number (without +)
- * @param {string} paymentData.externalId - Unique transaction ID (e.g., ticket ID)
- * @param {string} paymentData.payerMessage - Message to payer (optional)
- * @param {string} paymentData.payeeNote - Note for payee (optional)
- * 
- * @returns {Promise<Object>} Payment response with referenceId and status
- * @throws {Error} If payment request fails
- */
 async function requestToPay(paymentData) {
+  if (shouldUseMock()) return getMockService().requestToPay(paymentData);
+
+  const { amount, currency, externalId } = paymentData;
+
+  // Accept phone from payer.partyId (MTN shape) or top-level phoneNumber
+  const rawPhone =
+    (paymentData.payer && paymentData.payer.partyId) ||
+    paymentData.phoneNumber ||
+    '';
+
+  if (!amount || Number(amount) <= 0) throw new Error('Invalid amount. Amount must be greater than 0.');
+  if (!currency) throw new Error('Currency is required.');
+  if (!rawPhone) throw new Error('Phone number is required.');
+  if (!externalId) throw new Error('externalId (transaction reference) is required.');
+
+  const referenceId = uuidv4();
+  const accessToken = await generateAccessToken();
+  const formattedPhone = String(rawPhone).replace(/[\s+]/g, '');
+
+  const requestBody = {
+    amount: String(amount),
+    currency: currency,
+    externalId: externalId,
+    payer: { partyIdType: 'MSISDN', partyId: formattedPhone },
+    payerMessage: paymentData.payerMessage || 'SafariTix Bus Ticket Payment',
+    payeeNote: paymentData.payeeNote || ('Payment for ' + externalId),
+  };
+
+  console.log('[MTN] Request-to-Pay:', {
+    referenceId: referenceId,
+    amount: requestBody.amount,
+    currency: currency,
+    phone: '***' + formattedPhone.slice(-4),
+  });
+
   try {
-    // Validate required fields
-    const { amount, currency, phoneNumber, externalId } = paymentData;
-    
-    if (!amount || amount <= 0) {
-      throw new Error('Invalid amount. Amount must be greater than 0.');
-    }
-    
-    if (!currency) {
-      throw new Error('Currency is required.');
-    }
-    
-    if (!phoneNumber) {
-      throw new Error('Phone number is required.');
-    }
-    
-    if (!externalId) {
-      throw new Error('External ID (transaction reference) is required.');
-    }
+    const subscriptionKey = readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY');
+    const targetEnvironment =
+      (process.env.MTN_ENV || 'sandbox') === 'production'
+        ? (process.env.MTN_TARGET_ENVIRONMENT || 'mtnrwanda')
+        : 'sandbox';
 
-    // Generate unique reference ID for this transaction
-    const referenceId = uuidv4();
-    
-    // Get access token
-    const accessToken = await generateAccessToken();
-    
-    // Format phone number (remove + and spaces)
-    const formattedPhone = phoneNumber.replace(/[\s+]/g, '');
-    
-    // Prepare payment request payload
-    const requestBody = {
-      amount: amount.toString(),
-      currency: currency,
-      externalId: externalId,
-      payer: {
-        partyIdType: 'MSISDN',
-        partyId: formattedPhone,
-      },
-      payerMessage: paymentData.payerMessage || 'SafariTix Bus Ticket Payment',
-      payeeNote: paymentData.payeeNote || `Payment for ticket ${externalId}`,
-    };
-
-    console.log('📤 Sending MTN Request-to-Pay:', {
-      referenceId,
-      amount: requestBody.amount,
-      currency: requestBody.currency,
-      phone: `***${formattedPhone.slice(-4)}`, // Log last 4 digits only
-    });
-
-    // Send request-to-pay to MTN API
     const response = await axios.post(
       `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/requesttopay`,
       requestBody,
       {
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${accessToken}`,
+          Authorization: `Bearer ${accessToken}`,
           'X-Reference-Id': referenceId,
-          'X-Target-Environment': MTN_CONFIG.TARGET_ENVIRONMENT,
-          'Ocp-Apim-Subscription-Key': process.env.MTN_CONSUMER_KEY,
+          'X-Target-Environment': targetEnvironment,
+          'Ocp-Apim-Subscription-Key': subscriptionKey,
         },
-        timeout: 30000, // 30 second timeout
+        timeout: 30000,
       }
     );
 
-    // MTN API returns 202 Accepted for successful request initiation
-    if (response.status === 202) {
-      console.log('✅ MTN Request-to-Pay initiated successfully');
-      
-      return {
-        success: true,
-        referenceId: referenceId,
-        status: 'PENDING',
-        message: 'Payment request sent successfully. Waiting for customer approval.',
-        externalId: externalId,
-      };
+    if (response.status !== 202) {
+      throw new Error('Unexpected response status: ' + response.status);
     }
 
-    // Unexpected status code
-    throw new Error(`Unexpected response status: ${response.status}`);
-    
+    console.log('[MTN] Request-to-Pay initiated successfully (202 Accepted)');
+    return {
+      success: true,
+      referenceId: referenceId,
+      status: 'PENDING',
+      message: 'Payment request sent successfully. Waiting for customer approval.',
+      externalId: externalId,
+    };
   } catch (error) {
-    console.error('❌ MTN Request-to-Pay Error:', error.response?.data || error.message);
-    
-    // Handle specific error cases
     if (error.response) {
-      const status = error.response.status;
-      const errorData = error.response.data;
-      
-      if (status === 400) {
-        throw new Error(`Invalid request: ${errorData?.message || 'Bad request to MTN API'}`);
-      } else if (status === 409) {
-        throw new Error('Duplicate transaction. This payment request already exists.');
-      } else if (status === 500) {
-        throw new Error('MTN API server error. Please try again later.');
-      }
+      const s = error.response.status;
+      const d = error.response.data;
+      console.error('[MTN] Request-to-Pay error', s, d);
+      if (s === 400) throw new Error('Invalid request: ' + (d && d.message ? d.message : 'bad request to MTN API'));
+      if (s === 409) throw new Error('Duplicate transaction. This payment reference already exists.');
+      if (s === 500) throw new Error('MTN API server error. Please try again later.');
+      throw new Error('MTN request-to-pay failed (HTTP ' + s + ')');
     }
-    
-    throw new Error(`Payment request failed: ${error.message}`);
+    throw new Error('Payment request failed: ' + error.message);
   }
 }
 
-/**
- * Check the status of a payment transaction
- * Use this to verify if a payment was successful
- * 
- * @param {string} referenceId - The reference ID from requestToPay
- * @returns {Promise<Object>} Transaction status
- * @throws {Error} If status check fails
- */
 async function checkTransactionStatus(referenceId) {
+  if (shouldUseMock()) return getMockService().checkTransactionStatus(referenceId);
+
+  if (!referenceId) throw new Error('Reference ID is required to check transaction status.');
+
+  const accessToken = await generateAccessToken();
+  console.log('[MTN] Checking transaction status:', referenceId);
+
   try {
-    if (!referenceId) {
-      throw new Error('Reference ID is required to check transaction status.');
-    }
+    const subscriptionKey = readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY');
+    const targetEnvironment =
+      (process.env.MTN_ENV || 'sandbox') === 'production'
+        ? (process.env.MTN_TARGET_ENVIRONMENT || 'mtnrwanda')
+        : 'sandbox';
 
-    // Get access token
-    const accessToken = await generateAccessToken();
-
-    console.log('🔍 Checking MTN transaction status:', referenceId);
-
-    // Query transaction status
     const response = await axios.get(
       `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/requesttopay/${referenceId}`,
       {
         headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'X-Target-Environment': MTN_CONFIG.TARGET_ENVIRONMENT,
-          'Ocp-Apim-Subscription-Key': process.env.MTN_CONSUMER_KEY,
+          Authorization: `Bearer ${accessToken}`,
+          'X-Target-Environment': targetEnvironment,
+          'Ocp-Apim-Subscription-Key': subscriptionKey,
         },
         timeout: 10000,
       }
     );
 
     const data = response.data;
-    
-    console.log('📊 Transaction Status:', {
-      referenceId,
-      status: data.status,
-      amount: data.amount,
-      currency: data.currency,
-    });
+    console.log('[MTN] Transaction Status:', { referenceId: referenceId, status: data.status });
 
     return {
       success: true,
       referenceId: referenceId,
-      status: data.status, // PENDING, SUCCESSFUL, or FAILED
+      status: data.status,
       amount: data.amount,
       currency: data.currency,
       financialTransactionId: data.financialTransactionId,
       externalId: data.externalId,
-      reason: data.reason, // Present if status is FAILED
+      reason: data.reason,
     };
-    
   } catch (error) {
-    console.error('❌ MTN Status Check Error:', error.response?.data || error.message);
-    
-    if (error.response?.status === 404) {
+    if (error.response && error.response.status === 404) {
       throw new Error('Transaction not found. Invalid reference ID.');
     }
-    
-    throw new Error(`Failed to check transaction status: ${error.message}`);
+    throw new Error('Failed to check transaction status: ' + error.message);
   }
 }
 
-/**
- * Get account balance (for monitoring purposes)
- * This can be used to check your MTN MoMo collection account balance
- * 
- * @returns {Promise<Object>} Account balance information
- * @throws {Error} If balance check fails
- */
 async function getAccountBalance() {
-  try {
-    const accessToken = await generateAccessToken();
-
-    const response = await axios.get(
-      `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/account/balance`,
-      {
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'X-Target-Environment': MTN_CONFIG.TARGET_ENVIRONMENT,
-          'Ocp-Apim-Subscription-Key': process.env.MTN_CONSUMER_KEY,
-        },
-        timeout: 10000,
-      }
-    );
-
-    return {
-      success: true,
-      availableBalance: response.data.availableBalance,
-      currency: response.data.currency,
-    };
-    
-  } catch (error) {
-    console.error('❌ MTN Balance Check Error:', error.response?.data || error.message);
-    throw new Error(`Failed to get account balance: ${error.message}`);
+  if (shouldUseMock()) {
+    var mock = getMockService();
+    return (mock.getAccountBalance && mock.getAccountBalance()) || { success: true, availableBalance: '0', currency: 'RWF' };
   }
+  const accessToken = await generateAccessToken();
+  const subscriptionKey = readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY');
+  const targetEnvironment =
+    (process.env.MTN_ENV || 'sandbox') === 'production'
+      ? (process.env.MTN_TARGET_ENVIRONMENT || 'mtnrwanda')
+      : 'sandbox';
+  const response = await axios.get(
+    `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/account/balance`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'X-Target-Environment': targetEnvironment,
+        'Ocp-Apim-Subscription-Key': subscriptionKey,
+      },
+      timeout: 10000,
+    }
+  );
+  return { success: true, availableBalance: response.data.availableBalance, currency: response.data.currency };
 }
 
-/**
- * Validate account holder (optional - check if phone number is registered)
- * This can be used to verify customer phone number before initiating payment
- * 
- * @param {string} phoneNumber - Phone number to validate
- * @param {string} accountHolderIdType - Type of account holder ID (default: 'msisdn')
- * @returns {Promise<Object>} Validation result
- * @throws {Error} If validation fails
- */
-async function validateAccountHolder(phoneNumber, accountHolderIdType = 'msisdn') {
+async function validateAccountHolder(phoneNumber, accountHolderIdType) {
+  if (!accountHolderIdType) accountHolderIdType = 'msisdn';
+  if (shouldUseMock()) return { success: true, isActive: true, phoneNumber: phoneNumber };
+  if (!phoneNumber) throw new Error('Phone number is required for validation.');
+
+  const accessToken = await generateAccessToken();
+  const subscriptionKey = readEnv('MTN_CONSUMER_KEY', 'PAYMENT_PRIMARY_KEY');
+  const targetEnvironment =
+    (process.env.MTN_ENV || 'sandbox') === 'production'
+      ? (process.env.MTN_TARGET_ENVIRONMENT || 'mtnrwanda')
+      : 'sandbox';
+  const formattedPhone = String(phoneNumber).replace(/[\s+]/g, '');
+
   try {
-    if (!phoneNumber) {
-      throw new Error('Phone number is required for validation.');
-    }
-
-    const accessToken = await generateAccessToken();
-    const formattedPhone = phoneNumber.replace(/[\s+]/g, '');
-
     const response = await axios.get(
       `${getBaseUrl()}/${MTN_CONFIG.API_VERSION}/accountholder/${accountHolderIdType}/${formattedPhone}/active`,
       {
         headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'X-Target-Environment': MTN_CONFIG.TARGET_ENVIRONMENT,
-          'Ocp-Apim-Subscription-Key': process.env.MTN_CONSUMER_KEY,
+          Authorization: `Bearer ${accessToken}`,
+          'X-Target-Environment': targetEnvironment,
+          'Ocp-Apim-Subscription-Key': subscriptionKey,
         },
         timeout: 10000,
       }
     );
-
-    return {
-      success: true,
-      isActive: response.data.result === true,
-      phoneNumber: formattedPhone,
-    };
-    
+    return { success: true, isActive: response.data.result === true, phoneNumber: formattedPhone };
   } catch (error) {
-    console.error('❌ MTN Account Validation Error:', error.response?.data || error.message);
-    
-    if (error.response?.status === 404) {
-      return {
-        success: false,
-        isActive: false,
-        phoneNumber: phoneNumber,
-        message: 'Phone number not registered with MTN Mobile Money',
-      };
+    if (error.response && error.response.status === 404) {
+      return { success: false, isActive: false, phoneNumber: phoneNumber, message: 'Phone number not registered with MTN Mobile Money' };
     }
-    
-    throw new Error(`Account validation failed: ${error.message}`);
+    throw new Error('Account validation failed: ' + error.message);
   }
 }
 
-/**
- * Process a complete payment flow
- * Convenience function that handles the full payment process
- * 
- * @param {Object} paymentData - Payment details
- * @returns {Promise<Object>} Payment result
- */
 async function processPayment(paymentData) {
   try {
-    // Step 1: Validate phone number (optional but recommended)
-    console.log('🔍 Step 1: Validating phone number...');
-    const validation = await validateAccountHolder(paymentData.phoneNumber);
-    
-    if (!validation.isActive) {
-      return {
-        success: false,
-        error: 'Phone number is not registered with MTN Mobile Money',
-        status: 'FAILED',
-      };
-    }
-
-    // Step 2: Initiate payment request
-    console.log('💳 Step 2: Initiating payment request...');
     const paymentRequest = await requestToPay(paymentData);
-
-    // Step 3: Return result (frontend will poll for status)
     return {
       success: true,
       referenceId: paymentRequest.referenceId,
@@ -411,19 +331,12 @@ async function processPayment(paymentData) {
       message: 'Payment request sent. Customer needs to approve on their phone.',
       externalId: paymentRequest.externalId,
     };
-    
   } catch (error) {
-    console.error('❌ Payment Processing Error:', error.message);
-    
-    return {
-      success: false,
-      error: error.message,
-      status: 'FAILED',
-    };
+    console.error('[MTN] processPayment error:', error.message);
+    return { success: false, error: error.message, status: 'FAILED' };
   }
 }
 
-// Export all functions
 module.exports = {
   generateAccessToken,
   requestToPay,

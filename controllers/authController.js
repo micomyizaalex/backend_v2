@@ -137,6 +137,14 @@ const register = async (req, res) => {
       email: user.email
     });
   } catch (error) {
+    if (error?.name === 'SequelizeUniqueConstraintError') {
+      return res.status(400).json({ error: 'An account with that email already exists.' });
+    }
+
+    if (error?.name === 'SequelizeValidationError' && Array.isArray(error.errors) && error.errors.length > 0) {
+      return res.status(400).json({ error: error.errors[0].message });
+    }
+
     res.status(400).json({ error: error.message });
   }
 };
