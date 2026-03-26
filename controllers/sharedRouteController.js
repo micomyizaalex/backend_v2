@@ -959,9 +959,26 @@ const bookTicket = async (req, res) => {
 const bookSharedTicket = async (req, res) => {
   let client;
   try {
-    const { schedule_id, from_stop, to_stop, seat_number, passenger_name } = req.body;
+    const {
+      schedule_id,
+      from_stop,
+      to_stop,
+      seat_number,
+      seat_numbers,
+      passenger_name,
+      email,
+      phone,
+    } = req.body;
     if (!schedule_id || !from_stop || !to_stop) {
       return res.status(400).json({ success: false, message: 'schedule_id, from_stop and to_stop are required' });
+    }
+
+    const requestedSeatNumbers = Array.isArray(seat_numbers)
+      ? seat_numbers.map((seat) => String(seat || '').trim()).filter(Boolean)
+      : (seat_number ? [String(seat_number).trim()] : []);
+
+    if (requestedSeatNumbers.length > 0 && new Set(requestedSeatNumbers).size !== requestedSeatNumbers.length) {
+      return res.status(400).json({ success: false, message: 'Duplicate seat numbers are not allowed' });
     }
 
     client = await pool.connect();
@@ -1061,36 +1078,42 @@ const bookSharedTicket = async (req, res) => {
       seatInventory.rows.map((row) => [String(row.seat_number), Boolean(row.is_driver)])
     );
 
-    let selectedSeat = seat_number ? String(seat_number) : null;
-    if (selectedSeat) {
+    let selectedSeats = requestedSeatNumbers;
+
+    for (const selectedSeat of selectedSeats) {
       const parsedSeat = Number(selectedSeat);
       if (!Number.isInteger(parsedSeat) || parsedSeat < 1 || parsedSeat > capacity) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ success: false, message: 'Selected seat_number is out of range' });
+        return res.status(400).json({ success: false, message: `Selected seat ${selectedSeat} is out of range` });
+      }
+
+      if (seatMetaByNumber.get(selectedSeat) === true) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Driver seat cannot be booked: ${selectedSeat}` });
+      }
+
+      if (occupancy.occupiedSeats.has(selectedSeat)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ success: false, message: `Selected seat is not available for this segment: ${selectedSeat}` });
       }
     }
 
-    if (selectedSeat && seatMetaByNumber.get(selectedSeat) === true) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ success: false, message: 'Driver seat cannot be booked' });
-    }
-
-    if (selectedSeat && occupancy.occupiedSeats.has(selectedSeat)) {
-      await client.query('ROLLBACK');
-      return res.status(409).json({ success: false, message: 'Selected seat is not available for this segment' });
-    }
-
-    if (!selectedSeat) {
+    if (selectedSeats.length === 0) {
+      let autoAssignedSeat = null;
       for (let seat = 1; seat <= capacity; seat += 1) {
         const candidate = String(seat);
         if (!occupancy.occupiedSeats.has(candidate) && seatMetaByNumber.get(candidate) !== true) {
-          selectedSeat = candidate;
+          autoAssignedSeat = candidate;
           break;
         }
       }
+
+      if (autoAssignedSeat) {
+        selectedSeats = [autoAssignedSeat];
+      }
     }
 
-    if (!selectedSeat) {
+    if (!selectedSeats.length) {
       await client.query('ROLLBACK');
       return res.status(400).json({ success: false, message: 'No passenger seats available for selected segment' });
     }
@@ -1152,14 +1175,38 @@ const bookSharedTicket = async (req, res) => {
     if (ticketColumns.has('from_stop')) returnCols.push('from_stop');
     if (ticketColumns.has('to_stop')) returnCols.push('to_stop');
 
-    const ticketIdResult = await client.query(
-      `
-        INSERT INTO tickets (${insertCols.join(', ')})
-        VALUES (${insertVals.join(', ')})
-        RETURNING ${returnCols.join(', ')}
-      `,
-      params
-    );
+    const bookedTickets = [];
+
+    for (const selectedSeat of selectedSeats) {
+      const localInsertCols = [...insertCols];
+      const localInsertVals = [...insertVals];
+      const localParams = [...params];
+      const seatIndex = localInsertCols.indexOf('seat_number');
+      const idIndex = localInsertCols.indexOf('id');
+      const bookingRefIndex = localInsertCols.indexOf('booking_ref');
+      const bookedAtIndex = localInsertCols.indexOf('booked_at');
+      const createdAtIndex = localInsertCols.indexOf('created_at');
+      const updatedAtIndex = localInsertCols.indexOf('updated_at');
+
+      if (idIndex >= 0) localParams[idIndex] = require('crypto').randomUUID();
+      if (seatIndex >= 0) localParams[seatIndex] = selectedSeat;
+      if (bookingRefIndex >= 0) localParams[bookingRefIndex] = `SHR-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+      if (bookedAtIndex >= 0) localParams[bookedAtIndex] = new Date();
+      if (createdAtIndex >= 0) localParams[createdAtIndex] = new Date();
+      if (updatedAtIndex >= 0) localParams[updatedAtIndex] = new Date();
+
+      const ticketInsertResult = await client.query(
+        `
+          INSERT INTO tickets (${localInsertCols.join(', ')})
+          VALUES (${localInsertVals.join(', ')})
+          RETURNING ${returnCols.join(', ')}
+        `,
+        localParams
+      );
+
+      bookedTickets.push(ticketInsertResult.rows[0]);
+      occupancy.occupiedSeats.add(String(selectedSeat));
+    }
 
     await client.query('COMMIT');
 
@@ -1168,9 +1215,9 @@ const bookSharedTicket = async (req, res) => {
       try {
         await pool.query(
           `UPDATE bus_schedules
-           SET booked_seats = booked_seats + 1
+           SET booked_seats = booked_seats + $2
            WHERE schedule_id::text = $1::text`,
-          [schedule.schedule_id]
+          [schedule.schedule_id, bookedTickets.length]
         );
       } catch (e) {
         console.error('Failed to update seat counts:', e.message);
@@ -1180,35 +1227,48 @@ const bookSharedTicket = async (req, res) => {
     // Send e-ticket email (fire-and-forget, does not block response)
     (async () => {
       try {
-        const userResult = await pool.query(
-          `SELECT email, COALESCE(full_name, email) AS name FROM users WHERE id::text = $1::text LIMIT 1`,
-          [passengerId]
-        );
-        if (userResult.rows.length) {
-          const u = userResult.rows[0];
-          if (!u.email) return;
-          const ticket = ticketIdResult.rows[0];
-          const depDate = schedule.date ? String(schedule.date).slice(0, 10) : '';
-          const depTime = schedule.time ? String(schedule.time).slice(0, 5) : '';
-          await sendETicketEmail({
-            userEmail: u.email,
-            userName: u.name || 'Valued Customer',
-            tickets: [{
-              id: ticket.ticket_id || ticket.id,
-              seat_number: ticket.seat_number,
-              booking_ref: ticket.booking_ref,
-              price: ticket.price
-            }],
-            scheduleInfo: {
-              origin: from_stop,
-              destination: to_stop,
-              schedule_date: depDate,
-              departure_time: depTime,
-              bus_plate: schedule.plate_number || ''
-            },
-            companyInfo: { name: 'SafariTix Transport' }
-          });
+        let recipientEmail = String(email || '').trim();
+        let recipientName = passenger_name || 'Valued Customer';
+
+        if (passengerId) {
+          const userResult = await pool.query(
+            `SELECT email, COALESCE(full_name, email) AS name FROM users WHERE id::text = $1::text LIMIT 1`,
+            [passengerId]
+          );
+          if (userResult.rows.length) {
+            const u = userResult.rows[0];
+            recipientEmail = recipientEmail || u.email || '';
+            recipientName = passenger_name || u.name || recipientName;
+          }
         }
+
+        if (!recipientEmail) return;
+
+        const depDate = schedule.date ? String(schedule.date).slice(0, 10) : '';
+        const depTime = schedule.time ? String(schedule.time).slice(0, 5) : '';
+        await sendETicketEmail({
+          userEmail: recipientEmail,
+          userName: recipientName,
+          passengerPhone: phone || null,
+          tickets: bookedTickets.map((ticket) => ({
+            id: ticket.ticket_id || ticket.id,
+            seat_number: ticket.seat_number,
+            booking_ref: ticket.booking_ref,
+            price: ticket.price,
+            from_stop,
+            to_stop,
+          })),
+          scheduleInfo: {
+            origin: from_stop,
+            destination: to_stop,
+            from_stop,
+            to_stop,
+            schedule_date: depDate,
+            departure_time: depTime,
+            bus_plate: schedule.plate_number || ''
+          },
+          companyInfo: { name: 'SafariTix Transport' }
+        });
       } catch (e) {
         console.error('Failed to send e-ticket email:', e.message);
       }
@@ -1218,10 +1278,11 @@ const bookSharedTicket = async (req, res) => {
     if (passengerId) {
       (async () => {
         try {
-          const ticket = ticketIdResult.rows[0];
           const depDate = schedule.date ? String(schedule.date).slice(0, 10) : '';
           const depTime = schedule.time ? String(schedule.time).slice(0, 5) : '';
           const dateStr = depDate ? ` on ${depDate}${depTime ? ' ' + depTime : ''}` : '';
+          const seatsLabel = bookedTickets.map((ticket) => ticket.seat_number || '—').join(', ');
+          const primaryTicket = bookedTickets[0];
 
           // Commuter name
           const userRes = await pool.query(
@@ -1234,9 +1295,9 @@ const bookSharedTicket = async (req, res) => {
           await NotificationService.createNotification(
             passengerId,
             'Ticket Confirmed',
-            `Your ticket from ${from_stop} to ${to_stop}${dateStr} is confirmed. Seat: ${ticket.seat_number || '—'}. Ref: ${ticket.booking_ref || ticket.ticket_id || ''}`,
+            `Your ticket from ${from_stop} to ${to_stop}${dateStr} is confirmed. Seat(s): ${seatsLabel}. Ref: ${primaryTicket.booking_ref || primaryTicket.ticket_id || ''}`,
             'ticket_booked',
-            { relatedId: ticket.ticket_id || ticket.id, relatedType: 'ticket' }
+            { relatedId: primaryTicket.ticket_id || primaryTicket.id, relatedType: 'ticket' }
           );
 
           // Notify driver
@@ -1249,9 +1310,9 @@ const bookSharedTicket = async (req, res) => {
             await NotificationService.createNotification(
               driverId,
               'New Passenger Booked',
-              `${commuterName} booked seat ${ticket.seat_number || '—'} on your bus for ${from_stop} → ${to_stop}${dateStr}.`,
+              `${commuterName} booked seat(s) ${seatsLabel} on your bus for ${from_stop} → ${to_stop}${dateStr}.`,
               'ticket_booked',
-              { relatedId: ticket.ticket_id || ticket.id, relatedType: 'ticket' }
+              { relatedId: primaryTicket.ticket_id || primaryTicket.id, relatedType: 'ticket' }
             );
           }
         } catch (e) {
@@ -1260,7 +1321,22 @@ const bookSharedTicket = async (req, res) => {
       })();
     }
 
-    res.status(201).json({ success: true, ticket: ticketIdResult.rows[0] });
+    res.status(201).json({
+      success: true,
+      ticket: bookedTickets[0],
+      tickets: bookedTickets,
+      booking: {
+        from: from_stop,
+        to: to_stop,
+        seats: bookedTickets.map((ticket) => ticket.seat_number),
+        departure_date: schedule.date ? String(schedule.date).slice(0, 10) : '',
+        departure_time: schedule.time ? String(schedule.time).slice(0, 5) : '',
+        bus_plate: schedule.plate_number || '',
+        email: String(email || '').trim() || null,
+        phone: String(phone || '').trim() || null,
+        booking_ref: bookedTickets[0]?.booking_ref || null,
+      },
+    });
   } catch (error) {
     if (client) await client.query('ROLLBACK');
     console.error('bookSharedTicket error:', error);

@@ -612,6 +612,7 @@ Website:         www.safaritix.com
 const sendETicketEmail = async ({
   userEmail,
   userName,
+  passengerPhone = null,
   tickets,
   scheduleInfo,
   companyInfo = {},
@@ -740,7 +741,7 @@ const sendETicketEmail = async ({
     const passengerData = {
       name: userName || 'Valued Customer',
       email: userEmail,
-      phone: null // Can be added if available
+      phone: passengerPhone || null
     };
 
     const tripData = {
