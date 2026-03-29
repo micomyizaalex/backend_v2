@@ -40,6 +40,9 @@ router.use('/complaints', complaintsRoutes);
 router.get('/stops', sharedRouteController.getAvailableStops);
 router.get('/search-trips', sharedRouteController.searchTrips);
 router.get('/available-seats', sharedRouteController.getAvailableSeats);
+router.post('/mobile/confirm-payment', sharedRouteController.confirmMobilePayment);
+router.get('/mobile/my-tickets', sharedRouteController.getGuestTickets);
+router.get('/mobile/booking/:bookingId/location', sharedRouteController.getGuestBookingLocation);
 router.post('/book-ticket', auth, sharedRouteController.bookTicket);
 router.get('/my-tickets', auth, sharedRouteController.getUserTickets);
 

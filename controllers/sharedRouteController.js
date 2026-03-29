@@ -1,6 +1,8 @@
 const pool = require('../config/pgPool');
+const { User } = require('../models');
 const { sendETicketEmail } = require('../services/eTicketService');
 const NotificationService = require('../services/notificationService');
+const QRCode = require('qrcode');
 
 const isValidDate = (value) => {
   if (!value) return false;
@@ -120,6 +122,211 @@ const getSegmentFare = async (client, fromStop, toStop, effectiveDate) => {
 
   if (!result.rows.length) return null;
   return Number(result.rows[0].price);
+};
+
+const ROUTE_COORDINATE_HINTS = {
+  kigali: { lat: -1.9441, lng: 30.0619 },
+  nyabugogo: { lat: -1.9423, lng: 30.0445 },
+  muhanga: { lat: -2.0833, lng: 29.75 },
+  huye: { lat: -2.5967, lng: 29.7333 },
+  butare: { lat: -2.5967, lng: 29.7333 },
+  rubavu: { lat: -1.6792, lng: 29.2586 },
+  musanze: { lat: -1.4998, lng: 29.6349 },
+};
+
+const normalizePlaceName = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const resolveRoutePoint = (name, fallback) => {
+  const normalized = normalizePlaceName(name);
+  if (!normalized) return fallback || null;
+
+  const direct = ROUTE_COORDINATE_HINTS[normalized];
+  if (direct) return direct;
+
+  const partial = Object.entries(ROUTE_COORDINATE_HINTS).find(([key]) => normalized.includes(key));
+  if (partial) return partial[1];
+
+  return fallback || null;
+};
+
+const toRadians = (degrees) => (Number(degrees || 0) * Math.PI) / 180;
+
+const calculateDistanceKm = (from, to) => {
+  if (!from || !to) return null;
+  const earthRadiusKm = 6371;
+  const latitudeDelta = toRadians(to.lat - from.lat);
+  const longitudeDelta = toRadians(to.lng - from.lng);
+  const fromLat = toRadians(from.lat);
+  const toLat = toRadians(to.lat);
+
+  const a =
+    Math.sin(latitudeDelta / 2) * Math.sin(latitudeDelta / 2) +
+    Math.cos(fromLat) * Math.cos(toLat) *
+    Math.sin(longitudeDelta / 2) * Math.sin(longitudeDelta / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+};
+
+const buildGuestDemoLocation = ({ fromName, toName, scheduleDate, departureTime, scheduleId }) => {
+  const fallbackStart = ROUTE_COORDINATE_HINTS.kigali;
+  const fallbackEnd = ROUTE_COORDINATE_HINTS.nyabugogo;
+  const fromPoint = resolveRoutePoint(fromName, fallbackStart);
+  const toPoint = resolveRoutePoint(toName, fallbackEnd);
+  const departureIso = scheduleDate
+    ? `${String(scheduleDate).slice(0, 10)}T${String(departureTime || '08:00').slice(0, 5)}:00`
+    : null;
+  const departureTimestamp = departureIso ? new Date(departureIso).getTime() : Date.now() - 15 * 60 * 1000;
+  const elapsedMs = Math.max(0, Date.now() - (Number.isFinite(departureTimestamp) ? departureTimestamp : Date.now()));
+  const totalMs = 95 * 60 * 1000;
+  const progress = Math.min(1, elapsedMs / totalMs);
+
+  const lat = fromPoint.lat + (toPoint.lat - fromPoint.lat) * progress;
+  const lng = fromPoint.lng + (toPoint.lng - fromPoint.lng) * progress;
+  const remainingKm = calculateDistanceKm({ lat, lng }, toPoint);
+  const etaMinutes = remainingKm !== null ? (remainingKm / 36) * 60 : null;
+
+  return {
+    scheduleId,
+    latitude: lat,
+    longitude: lng,
+    speed: 36,
+    heading: null,
+    timestamp: new Date().toISOString(),
+    source: 'demo_simulation',
+    distanceRemainingKm: remainingKm,
+    etaMinutes,
+    currentLocationLabel: fromName && toName
+      ? `Between ${fromName} and ${toName}`
+      : 'On route',
+  };
+};
+
+const getLatestGuestLocationForBooking = async (client, scheduleId, busId, routeFrom, routeTo, scheduleDate, departureTime) => {
+  const result = await client.query(
+    `
+      SELECT
+        latitude,
+        longitude,
+        speed,
+        heading,
+        recorded_at
+      FROM live_bus_locations
+      WHERE ($1::text IS NOT NULL AND schedule_id::text = $1::text)
+         OR ($2::text IS NOT NULL AND bus_id::text = $2::text)
+      ORDER BY recorded_at DESC NULLS LAST, updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+      LIMIT 1
+    `,
+    [scheduleId || null, busId || null]
+  ).catch(() => ({ rows: [] }));
+
+  const latest = result.rows[0] || null;
+  if (latest) {
+    const destination = resolveRoutePoint(routeTo, null);
+    const currentPoint = {
+      lat: parseFloat(latest.latitude),
+      lng: parseFloat(latest.longitude),
+    };
+    const speed = latest.speed ? parseFloat(latest.speed) : null;
+    const distanceRemainingKm = destination ? calculateDistanceKm(currentPoint, destination) : null;
+    const etaMinutes = speed && speed > 0 && distanceRemainingKm !== null
+      ? (distanceRemainingKm / speed) * 60
+      : null;
+
+    return {
+      demo: false,
+      location: {
+        latitude: currentPoint.lat,
+        longitude: currentPoint.lng,
+        speed,
+        heading: latest.heading ? parseFloat(latest.heading) : null,
+        timestamp: latest.recorded_at,
+        source: 'live_gps',
+        currentLocationLabel: routeFrom && routeTo
+          ? `Between ${routeFrom} and ${routeTo}`
+          : 'On route',
+      },
+      calculations: {
+        distanceRemainingKm,
+        etaMinutes,
+      },
+    };
+  }
+
+  const simulated = buildGuestDemoLocation({
+    fromName: routeFrom,
+    toName: routeTo,
+    scheduleDate,
+    departureTime,
+    scheduleId,
+  });
+
+  return {
+    demo: true,
+    location: {
+      latitude: simulated.latitude,
+      longitude: simulated.longitude,
+      speed: simulated.speed,
+      heading: simulated.heading,
+      timestamp: simulated.timestamp,
+      source: simulated.source,
+      currentLocationLabel: simulated.currentLocationLabel,
+    },
+    calculations: {
+      distanceRemainingKm: simulated.distanceRemainingKm,
+      etaMinutes: simulated.etaMinutes,
+    },
+  };
+};
+
+const ensureMobilePassenger = async ({ email, passengerName, phoneNumber }) => {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) {
+    const err = new Error('email is required');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const normalizedName = String(passengerName || '').trim() || 'Mobile Passenger';
+  const normalizedPhone = String(phoneNumber || '').trim() || null;
+
+  let user = await User.findOne({ where: { email: normalizedEmail } });
+  if (user) {
+    const updates = {};
+    if (normalizedPhone && !user.phone_number) updates.phone_number = normalizedPhone;
+    if (normalizedName && (!user.full_name || user.full_name === user.email)) updates.full_name = normalizedName;
+    if (Object.keys(updates).length > 0) {
+      await user.update(updates);
+    }
+    return user;
+  }
+
+  const { randomUUID } = require('crypto');
+  try {
+    return await User.create({
+      full_name: normalizedName,
+      email: normalizedEmail,
+      password: randomUUID(),
+      phone_number: normalizedPhone,
+      role: 'commuter',
+      is_active: true,
+      email_verified: true,
+      company_verified: false,
+      account_status: 'approved',
+      must_change_password: false,
+    });
+  } catch (error) {
+    if (error?.name === 'SequelizeUniqueConstraintError') {
+      const existing = await User.findOne({ where: { email: normalizedEmail } });
+      if (existing) return existing;
+    }
+    throw error;
+  }
 };
 
 const getScheduleOccupancy = async (client, scheduleId, routeStops, fromStop, toStop) => {
@@ -1287,6 +1494,620 @@ const bookSharedTicket = async (req, res) => {
   }
 };
 
+const confirmMobilePayment = async (req, res) => {
+  let client;
+  try {
+    const schedule_id = req.body.schedule_id || req.body.scheduleId;
+    const from_stop = (req.body.from_stop || req.body.from || req.body.pickup_stop || '').toString().trim();
+    const to_stop = (req.body.to_stop || req.body.to || req.body.dropoff_stop || '').toString().trim();
+    const passenger_name = (req.body.passenger_name || req.body.passengerName || '').toString().trim();
+    const email = (req.body.email || '').toString().trim();
+    const phone = (req.body.phone || req.body.phone_number || '').toString().trim();
+    const rawSeats = Array.isArray(req.body.seat_numbers)
+      ? req.body.seat_numbers
+      : Array.isArray(req.body.seats)
+        ? req.body.seats
+        : [];
+
+    const selectedSeats = Array.from(new Set(rawSeats.map((seat) => String(seat).trim()).filter(Boolean)));
+
+    if (!schedule_id || !from_stop || !to_stop) {
+      return res.status(400).json({
+        success: false,
+        message: 'schedule_id, from_stop and to_stop are required',
+      });
+    }
+
+    if (selectedSeats.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'seat_numbers must contain at least one seat',
+      });
+    }
+
+    const passenger = await ensureMobilePassenger({
+      email,
+      passengerName: passenger_name,
+      phoneNumber: phone,
+    });
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const scheduleTable = await getScheduleTableName(client);
+    const scheduleResult = await client.query(
+      scheduleTable === 'bus_schedules'
+        ? `
+            SELECT
+              bs.schedule_id,
+              bs.bus_id,
+              bs.route_id,
+              bs.company_id,
+              bs.date,
+              bs.time,
+              bs.capacity,
+              COALESCE(bs.status, 'scheduled') AS status,
+              b.status AS bus_status,
+              b.plate_number,
+              rr.price
+            FROM bus_schedules bs
+            INNER JOIN buses b ON b.id = bs.bus_id
+            INNER JOIN rura_routes rr ON rr.id::text = bs.route_id
+            WHERE bs.schedule_id::text = $1::text
+            FOR UPDATE
+          `
+        : `
+            SELECT
+              bs.id AS schedule_id,
+              bs.bus_id,
+              bs.route_id,
+              bs.schedule_date AS date,
+              bs.departure_time AS time,
+              COALESCE(bs.total_seats, bs.available_seats + bs.booked_seats) AS capacity,
+              COALESCE(bs.status, 'scheduled') AS status,
+              b.status AS bus_status,
+              b.plate_number,
+              rr.price
+            FROM schedules bs
+            INNER JOIN buses b ON b.id = bs.bus_id
+            INNER JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+            WHERE bs.id::text = $1::text
+            FOR UPDATE
+          `,
+      [schedule_id]
+    );
+
+    if (!scheduleResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Schedule not found' });
+    }
+
+    const schedule = scheduleResult.rows[0];
+    const scheduleDeparted = await hasScheduleDeparturePassed(client, schedule.date, schedule.time);
+    if (scheduleDeparted) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'This trip has already departed' });
+    }
+
+    if ((schedule.status || '').toLowerCase() === 'cancelled') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Schedule is cancelled' });
+    }
+    if ((schedule.bus_status || '').toLowerCase() !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Assigned bus is not active' });
+    }
+
+    const routeStops = await getStopsByRoute(client, schedule.route_id);
+    if (routeStops.length < 2) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Route stops are not configured' });
+    }
+
+    const occupancy = await getScheduleOccupancy(client, schedule.schedule_id, routeStops, from_stop, to_stop);
+    if (occupancy.fromSeq < 0 || occupancy.toSeq < 0 || occupancy.fromSeq >= occupancy.toSeq) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'Invalid boarding segment' });
+    }
+
+    const capacity = toInt(schedule.capacity, 0);
+    if (occupancy.occupiedSeats.size >= capacity) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, message: 'No seats available for selected segment' });
+    }
+
+    const seatInventory = await client.query(
+      `
+        SELECT seat_number, COALESCE(is_driver, false) AS is_driver
+        FROM seats
+        WHERE bus_id::text = $1::text
+      `,
+      [schedule.bus_id]
+    );
+    const seatMetaByNumber = new Map(
+      seatInventory.rows.map((row) => [String(row.seat_number), Boolean(row.is_driver)])
+    );
+
+    const segPrice = await getSegmentFare(client, from_stop, to_stop, schedule.date);
+    if (segPrice === null) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: 'No active RURA tariff found for the selected segment',
+      });
+    }
+
+    const totalAmount = Number(segPrice) * selectedSeats.length;
+    const paymentColumns = await getTableColumns(client, 'payments');
+    const paymentRef = `MOB-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    const { randomUUID } = require('crypto');
+    const paymentCols = [];
+    const paymentVals = [];
+    const paymentParams = [];
+    const addPaymentCol = (col, val) => {
+      if (!paymentColumns.has(col)) return;
+      paymentCols.push(col);
+      paymentParams.push(val);
+      paymentVals.push(`$${paymentParams.length}`);
+    };
+
+    addPaymentCol('id', randomUUID());
+    addPaymentCol('user_id', passenger.id);
+    addPaymentCol('schedule_id', schedule.schedule_id);
+    addPaymentCol('payment_method', 'mobile_money');
+    addPaymentCol('phone_or_card', phone || email);
+    addPaymentCol('amount', totalAmount);
+    addPaymentCol('status', 'success');
+    addPaymentCol('booking_status', 'paid');
+    addPaymentCol('transaction_ref', paymentRef);
+    addPaymentCol('provider_name', 'mobile');
+    addPaymentCol('provider_reference', paymentRef);
+    addPaymentCol('provider_status', 'success');
+    addPaymentCol('currency', 'RWF');
+    addPaymentCol('seat_numbers', JSON.stringify(selectedSeats));
+    addPaymentCol('meta', JSON.stringify({
+      source: 'mobile_confirm_payment',
+      from_stop,
+      to_stop,
+      passenger_name: passenger_name || passenger.full_name || 'Mobile Passenger',
+      passenger_email: email,
+      passenger_phone: phone || null,
+      route_id: schedule.route_id,
+      bus_id: schedule.bus_id,
+      schedule_source: scheduleTable,
+      trip_date: schedule.date ? String(schedule.date).slice(0, 10) : null,
+    }));
+    addPaymentCol('completed_at', new Date());
+    addPaymentCol('created_at', new Date());
+    addPaymentCol('updated_at', new Date());
+
+    const paymentInsert = await client.query(
+      `
+        INSERT INTO payments (${paymentCols.join(', ')})
+        VALUES (${paymentVals.join(', ')})
+        RETURNING *
+      `,
+      paymentParams
+    );
+    const payment = paymentInsert.rows[0];
+
+    const scheduleInfo = {
+      origin: from_stop,
+      destination: to_stop,
+      schedule_date: schedule.date ? String(schedule.date).slice(0, 10) : null,
+      departure_time: schedule.time ? String(schedule.time).slice(0, 5) : null,
+      bus_plate: schedule.plate_number || null,
+    };
+
+    const bookedTickets = [];
+    const occupiedSeats = new Set(occupancy.occupiedSeats);
+    const ticketColumns = await getTableColumns(client, 'tickets');
+    for (const rawSeat of selectedSeats) {
+      const selectedSeat = String(rawSeat);
+      const parsedSeat = Number(selectedSeat);
+
+      if (!Number.isInteger(parsedSeat) || parsedSeat < 1 || parsedSeat > capacity) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Seat ${selectedSeat} is out of range` });
+      }
+
+      if (seatMetaByNumber.get(selectedSeat) === true) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `Seat ${selectedSeat} cannot be booked` });
+      }
+
+      if (occupiedSeats.has(selectedSeat)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          success: false,
+          message: `Selected seat ${selectedSeat} is not available for this segment`,
+        });
+      }
+
+      const insertCols = [];
+      const insertVals = [];
+      const params = [];
+      const add = (col, val) => {
+        if (!ticketColumns.has(col)) return;
+        insertCols.push(col);
+        params.push(val);
+        insertVals.push(`$${params.length}`);
+      };
+
+      add('id', randomUUID());
+      add('passenger_id', passenger.id);
+      add('schedule_id', schedule.schedule_id);
+      add('company_id', schedule.company_id || null);
+      add('route_id', schedule.route_id);
+      add('trip_date', schedule.date ? String(schedule.date).slice(0, 10) : null);
+      add('from_stop', from_stop);
+      add('to_stop', to_stop);
+      add('from_sequence', occupancy.fromSeq);
+      add('to_sequence', occupancy.toSeq);
+      add('seat_number', selectedSeat);
+      add('price', segPrice);
+      add('passenger_name', passenger_name || passenger.full_name || 'Mobile Passenger');
+      add('status', 'CONFIRMED');
+      add('booking_ref', `MOB-${Date.now()}-${Math.floor(Math.random() * 100000)}`);
+      add('payment_id', payment.id);
+      add('booked_at', new Date());
+      add('created_at', new Date());
+      add('updated_at', new Date());
+
+      if (!insertCols.includes('passenger_id') || !insertCols.includes('schedule_id') || !insertCols.includes('seat_number') || !insertCols.includes('payment_id')) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ success: false, message: 'Tickets schema is missing required columns' });
+      }
+
+      const ticketResult = await client.query(
+        `
+          INSERT INTO tickets (${insertCols.join(', ')})
+          VALUES (${insertVals.join(', ')})
+          RETURNING *
+        `,
+        params
+      );
+
+      const ticket = ticketResult.rows[0];
+      const ticketQrData = {
+        bookingId: payment.id,
+        bookingRef: payment.transaction_ref || payment.id,
+        userId: passenger.id,
+        ticketId: ticket.id,
+        ticketNumber: ticket.booking_ref || ticket.id,
+        from: from_stop,
+        to: to_stop,
+        seatNumber: ticket.seat_number,
+        seatNumbers: selectedSeats.map((seat) => String(seat)),
+        seats: selectedSeats.map((seat) => String(seat)),
+        date: scheduleInfo.schedule_date,
+        bus: scheduleInfo.bus_plate,
+      };
+      const ticketQrCodeUrl = await QRCode.toDataURL(JSON.stringify(ticketQrData), {
+        errorCorrectionLevel: 'M',
+        margin: 1,
+        width: 220,
+      });
+
+      if (ticketColumns.has('qr_code_url')) {
+        await client.query(
+          'UPDATE tickets SET qr_code_url = $1, updated_at = NOW() WHERE id = $2',
+          [ticketQrCodeUrl, ticket.id]
+        );
+      }
+
+      ticket.qr_code_url = ticketQrCodeUrl;
+      ticket.qr_data = ticketQrData;
+      bookedTickets.push(ticket);
+      occupiedSeats.add(selectedSeat);
+    }
+
+    await client.query('COMMIT');
+
+    sendETicketEmail({
+      userEmail: email,
+      userName: passenger_name || passenger.full_name || 'Mobile Passenger',
+      tickets: bookedTickets,
+      scheduleInfo,
+      companyInfo: { name: 'SafariTix Transport' },
+      bookingId: payment.id,
+      userId: passenger.id,
+    }).catch((err) => {
+      console.error('[confirmMobilePayment] e-ticket email error:', err.message);
+    });
+
+    return res.status(200).json({
+      success: true,
+      booking: {
+        bookingId: payment.id,
+        booking_ref: bookedTickets[0]?.booking_ref || null,
+        from: from_stop,
+        to: to_stop,
+        seats: bookedTickets.map((ticket) => ticket.seat_number).filter(Boolean),
+        departure_date: scheduleInfo.schedule_date,
+        departure_time: scheduleInfo.departure_time,
+        bus_plate: scheduleInfo.bus_plate,
+        email,
+        phone,
+      },
+      tickets: bookedTickets.map((ticket) => ({
+        id: ticket.id,
+        ticketId: ticket.id,
+        booking_ref: ticket.booking_ref,
+        bookingRef: ticket.booking_ref,
+        seat_number: ticket.seat_number,
+        seatNumber: ticket.seat_number,
+        ticketNumber: ticket.booking_ref || ticket.id,
+        bookingId: payment.id,
+        bookingRef: payment.transaction_ref || payment.id,
+        qrData: ticket.qr_data,
+        qr_code_url: ticket.qr_code_url,
+        qrCodeUrl: ticket.qr_code_url,
+      })),
+      qrData: bookedTickets[0]?.qr_data || null,
+      qrCodeUrl: bookedTickets[0]?.qr_code_url || null,
+    });
+  } catch (error) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch {}
+      client.release();
+    }
+    console.error('confirmMobilePayment error:', error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      error: 'Failed to confirm mobile payment',
+      message: error.message || 'An unexpected error occurred',
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+const getGuestTickets = async (req, res) => {
+  let client;
+  try {
+    const email = String(req.query.email || req.body?.email || '').trim();
+    const bookingId = String(req.query.bookingId || req.query.booking_id || req.body?.bookingId || req.body?.booking_id || '').trim();
+    const bookingRef = String(req.query.bookingRef || req.query.booking_ref || req.body?.bookingRef || req.body?.booking_ref || '').trim();
+    const bookingLookup = bookingId || bookingRef;
+
+    if (!email || !bookingLookup) {
+      return res.status(400).json({
+        success: false,
+        message: 'email and bookingId are required',
+      });
+    }
+
+    client = await pool.connect();
+
+    const bookingResult = await client.query(
+      `
+        SELECT
+          p.id AS booking_id,
+          p.transaction_ref,
+          p.amount,
+          p.booking_status,
+          p.status AS payment_status,
+          p.schedule_id,
+          p.meta,
+          u.id AS passenger_id,
+          u.full_name AS passenger_name,
+          u.email AS passenger_email,
+          u.phone_number AS passenger_phone
+        FROM payments p
+        INNER JOIN users u ON u.id = p.user_id
+        WHERE (p.id::text = $1::text OR LOWER(COALESCE(p.transaction_ref, '')) = LOWER($1))
+          AND LOWER(u.email) = LOWER($2)
+        LIMIT 1
+      `,
+      [bookingLookup, email]
+    );
+
+    if (!bookingResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'No booking found for the provided email and booking ID',
+      });
+    }
+
+    const booking = bookingResult.rows[0];
+    const ticketResult = await client.query(
+      `
+        SELECT
+          t.id,
+          t.booking_ref,
+          t.seat_number,
+          t.price,
+          t.status,
+          t.qr_code_url,
+          t.payment_id,
+          t.schedule_id,
+          COALESCE(r.origin, rr.from_location, t.from_stop, '') AS route_from,
+          COALESCE(r.destination, rr.to_location, t.to_stop, '') AS route_to,
+          COALESCE(s.schedule_date, bs.date) AS schedule_date,
+          COALESCE(s.departure_time, bs.time) AS departure_time,
+          b.id AS bus_id,
+          b.plate_number AS bus_plate
+        FROM tickets t
+        LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        LEFT JOIN routes r ON r.id = s.route_id
+        LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+        LEFT JOIN buses b ON b.id = COALESCE(s.bus_id, bs.bus_id)
+        WHERE t.payment_id::text = $1::text
+        ORDER BY
+          CASE WHEN t.seat_number ~ '^[0-9]+$' THEN t.seat_number::int END ASC NULLS LAST,
+          t.created_at ASC
+      `,
+      [booking.booking_id]
+    );
+
+    const tickets = ticketResult.rows.map((ticket) => {
+      const qrData = {
+        bookingId: booking.booking_id,
+        bookingRef: booking.transaction_ref || booking.booking_id,
+        userId: booking.passenger_id,
+        ticketId: ticket.id,
+        ticketNumber: ticket.booking_ref || ticket.id,
+        from: ticket.route_from || null,
+        to: ticket.route_to || null,
+        seatNumber: ticket.seat_number || null,
+        seatNumbers: ticket.seat_number ? [String(ticket.seat_number)] : [],
+        seats: ticket.seat_number ? [String(ticket.seat_number)] : [],
+        date: ticket.schedule_date ? String(ticket.schedule_date).slice(0, 10) : null,
+        bus: ticket.bus_plate || null,
+      };
+
+      return {
+        id: ticket.id,
+        ticketId: ticket.id,
+        bookingId: booking.booking_id,
+        bookingRef: booking.transaction_ref || booking.booking_id,
+        booking_ref: ticket.booking_ref,
+        ticketNumber: ticket.booking_ref || ticket.id,
+        seat_number: ticket.seat_number,
+        seatNumber: ticket.seat_number,
+        routeFrom: ticket.route_from || 'N/A',
+        routeTo: ticket.route_to || 'N/A',
+        departureDate: ticket.schedule_date ? String(ticket.schedule_date).slice(0, 10) : null,
+        departureTime: ticket.departure_time ? String(ticket.departure_time).slice(0, 5) : null,
+        busId: ticket.bus_id || null,
+        busPlate: ticket.bus_plate || null,
+        scheduleId: ticket.schedule_id || booking.schedule_id || null,
+        qrData,
+        qrCodeUrl: ticket.qr_code_url || null,
+      };
+    });
+
+    return res.json({
+      success: true,
+      booking: {
+        bookingId: booking.booking_id,
+        bookingRef: booking.transaction_ref || booking.booking_id,
+        email: booking.passenger_email,
+        phone: booking.passenger_phone,
+      },
+      tickets,
+    });
+  } catch (error) {
+    console.error('getGuestTickets error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch guest tickets',
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+const getGuestBookingLocation = async (req, res) => {
+  let client;
+  try {
+    const email = String(req.query.email || req.body?.email || '').trim();
+    const bookingId = String(req.params.bookingId || req.query.bookingId || req.query.booking_id || req.body?.bookingId || '').trim();
+    const bookingRef = String(req.query.bookingRef || req.query.booking_ref || req.body?.bookingRef || req.body?.booking_ref || '').trim();
+    const bookingLookup = bookingId || bookingRef;
+
+    if (!email || !bookingLookup) {
+      return res.status(400).json({
+        success: false,
+        message: 'email and bookingId are required',
+      });
+    }
+
+    client = await pool.connect();
+    const bookingResult = await client.query(
+      `
+        SELECT
+          p.id AS booking_id,
+          p.transaction_ref,
+          p.schedule_id,
+          u.id AS passenger_id,
+          u.full_name AS passenger_name,
+          u.email AS passenger_email
+        FROM payments p
+        INNER JOIN users u ON u.id = p.user_id
+        WHERE (p.id::text = $1::text OR LOWER(COALESCE(p.transaction_ref, '')) = LOWER($1))
+          AND LOWER(u.email) = LOWER($2)
+        LIMIT 1
+      `,
+      [bookingLookup, email]
+    );
+
+    if (!bookingResult.rows.length) {
+      return res.status(404).json({ success: false, message: 'Booking not found' });
+    }
+
+    const booking = bookingResult.rows[0];
+    const ticketResult = await client.query(
+      `
+        SELECT
+          t.id,
+          t.booking_ref,
+          t.seat_number,
+          t.status,
+          COALESCE(r.origin, rr.from_location, t.from_stop, '') AS route_from,
+          COALESCE(r.destination, rr.to_location, t.to_stop, '') AS route_to,
+          COALESCE(s.schedule_date, bs.date) AS schedule_date,
+          COALESCE(s.departure_time, bs.time) AS departure_time,
+          b.id AS bus_id,
+          b.plate_number,
+          COALESCE(s.schedule_id, bs.schedule_id) AS schedule_id
+        FROM tickets t
+        LEFT JOIN schedules s ON s.id::text = t.schedule_id::text
+        LEFT JOIN bus_schedules bs ON bs.schedule_id::text = t.schedule_id::text
+        LEFT JOIN routes r ON r.id = s.route_id
+        LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+        LEFT JOIN buses b ON b.id = COALESCE(s.bus_id, bs.bus_id)
+        WHERE t.payment_id::text = $1::text
+        ORDER BY t.created_at ASC
+        LIMIT 1
+      `,
+      [booking.booking_id]
+    );
+
+    const ticket = ticketResult.rows[0];
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: 'Ticket not found for booking' });
+    }
+
+    const tracking = await getLatestGuestLocationForBooking(
+      client,
+      ticket.schedule_id || booking.schedule_id || null,
+      ticket.bus_id || null,
+      ticket.route_from || null,
+      ticket.route_to || null,
+      ticket.schedule_date || null,
+      ticket.departure_time || null
+    );
+
+    return res.json({
+      success: true,
+      booking: {
+        bookingId: booking.booking_id,
+        bookingRef: booking.transaction_ref || booking.booking_id,
+        email: booking.passenger_email,
+        name: booking.passenger_name,
+        scheduleId: ticket.schedule_id || booking.schedule_id || null,
+        busId: ticket.bus_id || null,
+        busPlate: ticket.plate_number || null,
+        from: ticket.route_from || 'N/A',
+        to: ticket.route_to || 'N/A',
+        seatNumber: ticket.seat_number || null,
+      },
+      ...tracking,
+    });
+  } catch (error) {
+    console.error('getGuestBookingLocation error:', error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch guest tracking location',
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
 const updateSharedScheduleStatus = async (req, res) => {
   let client;
   try {
@@ -1395,6 +2216,9 @@ module.exports = {
   getAvailableSeats,
   bookTicket,
   bookSharedTicket,
+  confirmMobilePayment,
+  getGuestTickets,
+  getGuestBookingLocation,
   getUserTickets,
   updateSharedScheduleStatus
 };

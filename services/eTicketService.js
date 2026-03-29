@@ -710,10 +710,15 @@ const sendETicketEmail = async ({
     // existing driver scanning/validation logic (which extracts ticketId).
     const qrData = {
       bookingId: bookingId || ticket.payment_id || ticket.booking_id || ticket.booking_ref || null,
+      bookingRef: ticket.booking_ref || ticket.bookingRef || null,
       userId: userId || ticket.passenger_id || ticket.user_id || null,
       from: bookedOrigin,
       to: bookedDestination,
       seats: seatNumbers.map((s) => String(s)),
+      seatNumbers: seatNumbers.map((s) => String(s)),
+      seatNumber: ticket.seat_number || ticket.seatNumber || null,
+      ticketNumber: ticket.booking_ref || ticket.id || null,
+      ticketIds: ticketIds,
       date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || scheduleDate || null,
       bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || scheduleInfo?.bus || null,
       ticketId: ticket.id || ticket.ticket_id || null

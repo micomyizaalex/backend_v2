@@ -78,14 +78,18 @@ const generateTicketQrDataUrl = async ({ ticketId, tripId, seatNumber, commuterI
   const payload = {
     ticket_id: ticketId,
     ticketId,
+    ticketNumber: bookingRef || ticketId || null,
     trip_id: tripId,
     tripId,
     schedule_id: tripId,
     seat_number: seatNumber,
     seat: seatNumber,
+    seatNumbers: seatNumber ? [String(seatNumber)] : [],
     commuter_id: commuterId,
     commuterId,
+    bookingId: bookingRef || null,
     booking_ref: bookingRef,
+    bookingRef,
     issued_at: new Date().toISOString(),
   };
 

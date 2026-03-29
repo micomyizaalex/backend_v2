@@ -471,13 +471,17 @@ const generateTicketQrDataUrl = async ({ ticket, bookingId, userId, scheduleInfo
     // ticket validation/scanning logic.
     const payload = {
       bookingId: bookingId || null,
+      bookingRef: ticket.booking_ref || ticket.bookingRef || null,
       userId: userId || null,
       from: scheduleInfo?.origin || scheduleInfo?.from || null,
       to: scheduleInfo?.destination || scheduleInfo?.to || null,
       seats: Array.isArray(seats) ? seats.map((s) => String(s)) : [],
+      seatNumbers: Array.isArray(seats) ? seats.map((s) => String(s)) : [],
+      seatNumber: ticket.seat_number || ticket.seatNumber || null,
       date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || null,
       bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || null,
       ticketId: ticket.id || ticket.ticket_id || null,
+      ticketNumber: ticket.booking_ref || ticket.bookingRef || ticket.id || ticket.ticket_id || null,
     };
 
     return await QRCode.toDataURL(JSON.stringify(payload), {
