@@ -1,3 +1,4 @@
+// models/User.js
 const { DataTypes } = require('sequelize');
 const bcrypt = require('bcryptjs');
 const sequelize = require("../config/database")
@@ -38,6 +39,23 @@ const User = sequelize.define('User', {
     defaultValue: 'commuter',
   },
   
+  // Driver-specific fields (only used when role='driver')
+  license_number: {
+    type: DataTypes.STRING,
+    allowNull: true,
+    unique: true,
+  },
+  
+  license_expiry: {
+    type: DataTypes.DATE,
+    allowNull: true,
+  },
+  
+  driver_notes: {
+    type: DataTypes.TEXT,
+    allowNull: true,
+  },
+  
   avatar_url: {
     type: DataTypes.TEXT,
     allowNull: true,
@@ -68,14 +86,9 @@ const User = sequelize.define('User', {
     defaultValue: false,
   },
 
-  company_verified: {
-    type: DataTypes.BOOLEAN,
-    defaultValue: false,
-  },
-
   account_status: {
-    type: DataTypes.STRING(50),
-    defaultValue: 'approved',
+    type: DataTypes.ENUM("pending", "approved", "suspended", "rejected"),
+    defaultValue: 'pending',
   },
 
   last_login: {
@@ -106,9 +119,29 @@ const User = sequelize.define('User', {
   timestamps: true,
   underscored: true,
   validate: {
+    companyAdminRequiresCompany() {
+      if (this.role === 'company_admin' && !this.company_id) {
+        throw new Error('Company admin users must have a company_id');
+      }
+    },
     driverRequiresCompany() {
       if (this.role === 'driver' && !this.company_id) {
         throw new Error('Driver users must have a company_id');
+      }
+    },
+    driverRequiresLicense() {
+      if (this.role === 'driver' && !this.license_number) {
+        throw new Error('Driver users must have a license_number');
+      }
+    },
+    commuterNoCompany() {
+      if (this.role === 'commuter' && this.company_id) {
+        throw new Error('Commuter users cannot have a company_id');
+      }
+    },
+    adminNoCompany() {
+      if (this.role === 'admin' && this.company_id) {
+        throw new Error('Admin users cannot have a company_id');
       }
     }
   },
@@ -127,7 +160,9 @@ const User = sequelize.define('User', {
   indexes: [
     { fields: ['email'], unique: true },
     { fields: ['role'] },
-    { fields: ['company_id'] }
+    { fields: ['company_id'] },
+    { fields: ['account_status'] },
+    { fields: ['license_number'], unique: true, where: { license_number: { [Op.ne]: null } } }
   ]
 });
 
@@ -144,8 +179,8 @@ User.prototype.toSafeObject = function() {
 
 // Instance method to get public profile (limited fields)
 User.prototype.toPublicProfile = function() {
-  const { password, email, preferences, ...publicProfile } = this.get({ plain: true });
+  const { password, email, permissions, preferences, license_number, license_expiry, ...publicProfile } = this.get({ plain: true });
   return publicProfile;
 };
 
-module.exports = User
+module.exports = User;
