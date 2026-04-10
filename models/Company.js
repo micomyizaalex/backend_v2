@@ -1,3 +1,4 @@
+// models/Company.js
 const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
@@ -13,6 +14,10 @@ const Company = sequelize.define(
     owner_id: {
       type: DataTypes.UUID,
       allowNull: false,
+      references: {
+        model: 'users',
+        key: 'id'
+      }
     },
 
     name: {
@@ -31,24 +36,23 @@ const Company = sequelize.define(
 
     phone: {
       type: DataTypes.STRING,
+      allowNull: false,
     },
 
     address: {
       type: DataTypes.TEXT,
+      allowNull: false,
     },
 
     country: {
       type: DataTypes.STRING(100),
-      allowNull: true,
-    },
-
-    rejection_reason: {
-      type: DataTypes.TEXT,
-      allowNull: true,
+      allowNull: false,
+      defaultValue: 'Rwanda',
     },
 
     logo_url: {
       type: DataTypes.TEXT,
+      allowNull: true,
     },
 
     status: {
@@ -56,51 +60,44 @@ const Company = sequelize.define(
       defaultValue: "pending",
     },
 
-    is_approved: {
-      type: DataTypes.BOOLEAN,
-      defaultValue: false,
-    },
-
-    approval_date: {
-      type: DataTypes.DATE,
+    rejection_reason: {
+      type: DataTypes.TEXT,
+      allowNull: true,
     },
 
     approved_by: {
       type: DataTypes.UUID,
+      allowNull: true,
+      references: {
+        model: 'users',
+        key: 'id'
+      }
+    },
+
+    approval_date: {
+      type: DataTypes.DATE,
+      allowNull: true,
     },
 
     subscription_status: {
-      type: DataTypes.ENUM("inactive", "pending_approval", "active", "expired"),
+      type: DataTypes.ENUM("inactive", "active", "expired", "suspended"),
       defaultValue: "inactive",
     },
 
-    subscription_paid: {
-      type: DataTypes.BOOLEAN,
-      defaultValue: false,
-    },
-
-    subscription_paid_date: {
+    subscription_start_date: {
       type: DataTypes.DATE,
+      allowNull: true,
     },
 
     subscription_expires_at: {
       type: DataTypes.DATE,
-    },
-
-    subscription_amount: {
-      type: DataTypes.DECIMAL(10, 2),
-      defaultValue: 50000.00,
+      allowNull: true,
     },
 
     plan: {
       type: DataTypes.ENUM('Starter', 'Growth', 'Enterprise'),
       allowNull: false,
       defaultValue: 'Starter',
-    },
-
-    next_payment: {
-      type: DataTypes.DATEONLY,
-      allowNull: true,
     },
   },
   {
@@ -111,7 +108,9 @@ const Company = sequelize.define(
       { fields: ['owner_id'] },
       { fields: ['status'] },
       { fields: ['subscription_status'] },
-      { fields: ['plan'] }
+      { fields: ['plan'] },
+      { unique: true, fields: ['name'] },
+      { unique: true, fields: ['email'] }
     ]
   }
 );
