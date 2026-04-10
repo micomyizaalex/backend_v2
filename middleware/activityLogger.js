@@ -46,5 +46,12 @@ const activityLogger = (req, res, next) => {
 
   next();
 };
+const notFound = (req, res, next) => {
+  res.status(404).json({
+    status: 'error',
+    message: `Cannot ${req.method} ${req.url}`,
+    timestamp: new Date().toISOString()
+  });
+};
 
-module.exports = activityLogger;
+module.exports = { activityLogger, notFound };
