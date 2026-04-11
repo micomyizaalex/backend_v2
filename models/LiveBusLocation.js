@@ -10,33 +10,49 @@ const LiveBusLocation = sequelize.define(
       allowNull: false,
       defaultValue: DataTypes.UUIDV4,
     },
-    schedule_id: {
+    
+    bus_id: {
       type: DataTypes.UUID,
       allowNull: false,
       references: {
-        model: 'bus_schedules',
-        key: 'schedule_id'
+        model: 'buses',
+        key: 'id'
       },
       onDelete: 'CASCADE'
     },
+    
+    schedule_id: {
+      type: DataTypes.UUID,
+      allowNull: true,
+      references: {
+        model: 'schedules',
+        key: 'id'
+      },
+      onDelete: 'SET NULL'
+    },
+    
     latitude: {
       type: DataTypes.DECIMAL(10, 8),
       allowNull: false,
     },
+    
     longitude: {
       type: DataTypes.DECIMAL(11, 8),
       allowNull: false,
     },
+    
     speed: {
       type: DataTypes.DECIMAL(5, 2),
-      defaultValue: null,
+      allowNull: true,
       comment: 'Speed in km/h'
     },
+    
     heading: {
       type: DataTypes.DECIMAL(5, 2),
-      defaultValue: null,
+      allowNull: true,
       comment: 'Direction in degrees (0-360)'
     },
+    
     recorded_at: {
       type: DataTypes.DATE,
       allowNull: false,
@@ -48,8 +64,9 @@ const LiveBusLocation = sequelize.define(
     timestamps: true,
     underscored: true,
     indexes: [
-      { fields: ['schedule_id', 'recorded_at'] },
-      { fields: ['schedule_id', 'updated_at'] },
+      { fields: ['bus_id'] },
+      { fields: ['bus_id', 'recorded_at'] },
+      { fields: ['schedule_id'] },
       { fields: ['recorded_at'] }
     ]
   }
