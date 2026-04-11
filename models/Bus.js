@@ -19,27 +19,18 @@ const Bus = sequelize.define(
       }
     },
 
-    driver_id: {
-      type: DataTypes.UUID,
-      allowNull: true,
-      comment: "Foreign key to Driver - each bus is assigned to a single driver"
-      ,
-      references: {
-        model: 'users',
-        key: 'id'
-      }
-    },
-
     plate_number: {
       type: DataTypes.STRING,
       allowNull: false,
     },
+    
     model: {
       type: DataTypes.STRING,
+      allowNull: false,
     },
 
     seat_layout: {
-      type: DataTypes.ENUM('25','30','50'),
+      type: DataTypes.ENUM('25', '30', '50'),
       allowNull: false,
       defaultValue: '30'
     },
@@ -50,7 +41,7 @@ const Bus = sequelize.define(
     },
 
     status: {
-      type: DataTypes.ENUM('ACTIVE','INACTIVE'),
+      type: DataTypes.ENUM('ACTIVE', 'INACTIVE', 'MAINTENANCE'),
       allowNull: false,
       defaultValue: 'ACTIVE'
     },
@@ -60,12 +51,10 @@ const Bus = sequelize.define(
     timestamps: true,
     underscored: true,
     indexes: [
-      { unique: true, fields: ['company_id', 'plate_number'] }
+      { unique: true, fields: ['company_id', 'plate_number'] },
+      { fields: ['status'] }
     ]
   }
 );
-
-
-  
 
 module.exports = Bus;
