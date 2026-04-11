@@ -1,5 +1,5 @@
 // models/User.js
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op } = require('sequelize'); 
 const bcrypt = require('bcryptjs');
 const sequelize = require("../config/database")
 
@@ -39,7 +39,6 @@ const User = sequelize.define('User', {
     defaultValue: 'commuter',
   },
   
-  // Driver-specific fields (only used when role='driver')
   license_number: {
     type: DataTypes.STRING,
     allowNull: true,
