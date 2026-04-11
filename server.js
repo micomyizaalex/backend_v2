@@ -1,5 +1,5 @@
 const dotenv = require('dotenv');
-const sequelize  = require('./config/database');
+const { sequelize } = require('./models/index');
 const { initializeSocket } = require('./config/socket');
 const { gracefulShutdown } = require('./utils/helpers');
 
@@ -19,7 +19,7 @@ const startServer = async () => {
     let isDatabaseConnected = false;
     try {
       await sequelize.authenticate();
-      await sequelize.sync({ alter: false }); // Set to true only if you want to sync schema changes
+      await sequelize.sync({ alter: true }); // Set to true only if you want to sync schema changes
       isDatabaseConnected = true;
       console.log('📡 Database connection established successfully.');
     } catch (dbError) {
