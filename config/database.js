@@ -8,7 +8,7 @@ if (!process.env.DATABASE_URL) {
 // Allow disabling SSL for local dev via DB_SSL=false
 const useDbSsl = process.env.DB_SSL !== 'false';
 
-const sequelize = new Sequelize("postgresql://neondb_owner:npg_YMZ76GrFtLOI@ep-lingering-lab-anhgc5qm-pooler.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require", {
+const sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: 'postgres',
     dialectOptions: {
         ...(useDbSsl ? { 
